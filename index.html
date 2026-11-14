@@ -119,11 +119,12 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <p>Misst Abstand und Relativgeschwindigkeit zum vorausfahrenden Fahrzeug aus dem Kamerabild.</p>
 
     <div class="warnbox">
-      <p><strong>Messgerät, kein Assistenzsystem.</strong> Greift nicht ins Fahrzeug ein und ist nicht dafür gebaut, sich im Verkehr darauf zu verlassen. Handy fest montieren, quer. Starten und bedienen nur im Stand oder durch den Beifahrer.</p>
+      <p><strong>Messgerät, kein Assistenzsystem.</strong> Greift nicht ins Fahrzeug ein und ist nicht dafür gebaut, sich im Verkehr darauf zu verlassen. Handy fest montieren. Starten und bedienen nur im Stand oder durch den Beifahrer.</p>
     </div>
 
     <h2>Vor dem Start</h2>
-    <p>Handy <strong>quer</strong> in eine feste Halterung, Kamera frei auf die Fahrbahn gerichtet. Die Erkennung braucht einmalig etwa 5 MB Modelldaten aus dem Netz.</p>
+    <p>Handy in eine feste Halterung, Kamera frei auf die Fahrbahn gerichtet. <strong>Hoch- und Querformat gehen beide.</strong> Hochkant liegen mehr Pixel auf dem Vordermann, das misst genauer; quer sieht die App in Kurven mehr zur Seite. Die Erkennung braucht einmalig etwa 5 MB Modelldaten aus dem Netz.</p>
+    <p class="hint">Stand 14.11.2026 — Brennweite wird jetzt aus der langen Bildkante gerechnet.</p>
 
     <div class="btns">
       <button class="pri" id="b-start">Kamera starten</button>
@@ -145,8 +146,9 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
   <div class="sheet-in">
     <h1>Einstellungen</h1>
 
-    <label for="i-fov">Blickwinkel der Kamera <b id="l-fov">69.7°</b></label>
+    <label for="i-fov">Blickwinkel über die lange Bildkante <b id="l-fov">69.7°</b></label>
     <input type="range" id="i-fov" min="30" max="110" step="0.1" value="69.7">
+    <div class="hint" id="l-optik">—</div>
 
     <label for="i-mode">Erkennung</label>
     <select id="i-mode">
@@ -205,8 +207,14 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <button id="b-testbeep">Warnton testen</button>
     </div>
 
-    <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.45</b></label>
-    <input type="range" id="i-conf" min="0.2" max="0.8" step="0.05" value="0.45">
+    <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.30</b></label>
+    <input type="range" id="i-conf" min="0.15" max="0.8" step="0.05" value="0.30">
+
+    <label for="i-boost">Gegenlichtausgleich</label>
+    <select id="i-boost">
+      <option value="1" selected>an — mehr Kontrast für die Erkennung</option>
+      <option value="0">aus</option>
+    </select>
 
     <div class="btns">
       <button class="pri" id="b-close">Zurück</button>
@@ -242,6 +250,19 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
 /* ---------------- Mathematik ---------------- */
 var focalPx = function(w, fovDeg){ return (w/2) / Math.tan(fovDeg*Math.PI/360); };
 var distFromBox = function(px, realW, f){ return f*realW/px; };
+
+/* --- Brennweite in Pixeln ---
+   Die Brennweite gehoert zum ganzen Bild, nicht zu einer seiner Kanten.
+   Der eingestellte Blickwinkel ist der ueber die LANGE Bildkante gemessene.
+   Haelt man das Handy hochkant, ist die lange Kante die Hoehe. Rechnet man
+   dort mit der Breite, faellt jeder Abstand um 16/9 = 1,78 zu kurz aus -
+   und die App warnt dauernd vor einer Luecke, die in Wahrheit sicher ist.
+   Deshalb immer die lange Kante nehmen, egal wie das Handy gehalten wird. */
+function longSide(){
+  var vw = video.videoWidth || 1, vh = video.videoHeight || vw;
+  return Math.max(vw, vh);
+}
+function focalVideo(){ return focalPx(longSide(), S.fov); }
 var fmt = function(n,d){ return isFinite(n) ? n.toFixed(d===undefined?1:d).replace(".",",") : "—"; };
 
 function Kalman(q,r){ this.q=q||0.6; this.r=r||4; this.ready=false; }
@@ -261,6 +282,7 @@ Kalman.prototype.update = function(z,dt){
 /* "Halber Tacho" ist bei jedem Tempo genau 1,8 s. */
 function judge(g){
   if(!isFinite(g)) return {c:"",t:""};
+  if(g<0.9) return {c:"crit", t:"VIEL ZU DICHT"};
   if(g<1.8) return {c:"crit", t:"UNTER HALBEM TACHO"};
   if(g<2.0) return {c:"warn", t:"knapp"};
   if(g<3.0) return {c:"good", t:"sicher"};
@@ -269,8 +291,9 @@ function judge(g){
 
 /* ---------------- Zustand ---------------- */
 var S = {
-  fov:69.7, realW:1.80, conf:0.45,
+  fov:69.7, realW:1.80, conf:0.30, boost:true,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
+  win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"",
   lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
@@ -349,6 +372,11 @@ async function start(){
   status("Lade Erkennungsmodell … (einmalig etwa 5 MB)");
   try{
     if(typeof cocoSsd === "undefined") throw new Error("Bibliothek nicht geladen");
+    /* Ohne Grafikbeschleunigung rechnet das Modell auf dem Hauptprozessor und
+       schafft nur noch ein paar Bilder je Sekunde. Deshalb WebGL erzwingen
+       und hinterher nachsehen, worauf es tatsaechlich laeuft. */
+    try{ await tf.setBackend("webgl"); await tf.ready(); }catch(e2){}
+    S.backend = (typeof tf !== "undefined" && tf.getBackend) ? tf.getBackend() : "";
     S.model = await cocoSsd.load({ base:"lite_mobilenet_v2" });
   }catch(e){
     // Ohne Modell geht es trotzdem weiter: dann wird von Hand gemessen.
@@ -368,6 +396,8 @@ async function start(){
     document.getElementById("verdict").textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
   }
   S.running = true;
+  S.lastDayHit = performance.now();
+  showOptik();
   detectLoop();
   requestAnimationFrame(draw);
 }
@@ -427,32 +457,101 @@ function grabFrame(){
   return { px:px, gray:gray, W:W, H:H, sc:vw/W };
 }
 
+/* --- Suchausschnitt fuer die Objekterkennung ---
+   Das Modell skaliert jedes Bild, das es bekommt, auf 300x300. In einem
+   1080 px breiten Bild schrumpft ein 57 px breites Auto dabei auf 16 px -
+   zu wenig, um es zu finden. Deshalb bekommt das Modell nicht das ganze
+   Bild, sondern einen Ausschnitt: beim verfolgten Ziel einen um das Ziel
+   herum, sonst wandernde Felder ueber der Fahrbahn und jedes vierte Mal
+   einen breiten. Im engen Ausschnitt ist dasselbe Auto dreimal so gross. */
+var SCAN = 320;
+var sCv = document.createElement("canvas"); sCv.width = sCv.height = SCAN;
+var sCx = sCv.getContext("2d");
+var scanIdx = 0, scanYs = [0.46, 0.58, 0.70];
+
+function clampWin(cx0, cy0, side, vw, vh, wide){
+  side = Math.min(side, Math.min(vw, vh));
+  return { x: Math.max(0, Math.min(vw - side, cx0 - side/2)),
+           y: Math.max(0, Math.min(vh - side, cy0 - side/2)),
+           w: side, h: side, wide: !!wide };
+}
+function scanWindow(vw, vh){
+  var t = S.track;
+  if(t && t.misses < 3)
+    return clampWin(t.x + t.w/2, t.y + t.h/2, Math.max(t.w*3.4, vw*0.20), vw, vh);
+  scanIdx = (scanIdx + 1) % 4;
+  if(scanIdx === 3) return clampWin(vw/2, vh*0.60, Math.min(vw, vh), vw, vh, true);
+  return clampWin(vw/2, vh*scanYs[scanIdx], vw*0.55, vw, vh);
+}
+function drawScan(win){
+  /* Gegen die tiefe Sonne ist der Vordermann eine dunkle Silhouette vor
+     hellem Himmel. Etwas mehr Kontrast holt ihn aus dem Gegenlicht. */
+  sCx.filter = S.boost ? "brightness(1.06) contrast(1.30)" : "none";
+  sCx.drawImage(video, win.x, win.y, win.w, win.h, 0, 0, SCAN, SCAN);
+  sCx.filter = "none";
+  return sCv;
+}
+
 /* --- Spurerkennung ---
    Fahrbahnmarkierungen sind helle, schmale Streifen auf dunklem Asphalt.
    Pro Bildzeile werden helle Abschnitte gesucht, nach links und rechts
    sortiert und je eine Gerade x = a*y + b hineingelegt. Kein Hough noetig. */
-function fitLine(pts){
-  if(pts.length < 6) return null;
-  function ls(list){
-    var n=list.length, sy=0, sx=0, syy=0, sxy=0;
-    for(var i=0;i<n;i++){ sy+=list[i].y; sx+=list[i].x; syy+=list[i].y*list[i].y; sxy+=list[i].x*list[i].y; }
-    var den = n*syy - sy*sy;
-    if(Math.abs(den) < 1e-6) return null;
-    var a = (n*sxy - sy*sx)/den;
-    return { a:a, b:(sx - a*sy)/n };
+function lsFit(list){
+  var n=list.length, sy=0, sx=0, syy=0, sxy=0;
+  for(var i=0;i<n;i++){ sy+=list[i].y; sx+=list[i].x; syy+=list[i].y*list[i].y; sxy+=list[i].x*list[i].y; }
+  var den = n*syy - sy*sy;
+  if(Math.abs(den) < 1e-6) return null;
+  var a = (n*sxy - sy*sx)/den;
+  return { a:a, b:(sx - a*sy)/n };
+}
+
+/* --- Geraden robust aus einer Punktwolke holen ---
+   In einer Bildzeile ist selten nur eine helle Stelle: die eigene Markierung,
+   die Randlinie, die Gegenfahrbahn, eine Leitplanke, eine Baumkante. Eine
+   einzige Ausgleichsgerade durch alles zusammen ergibt Unsinn - genau das war
+   die Linie, die quer durch die Baeume lief. Deshalb werden aus Punktepaaren
+   Geradenvorschlaege gebildet, der mit den meisten Stuetzpunkten behalten,
+   dessen Punkte herausgenommen und noch einmal gesucht. Die Paare werden fest
+   abgezaehlt, nicht gewuerfelt: dasselbe Bild soll dasselbe Ergebnis geben. */
+function findLines(pts, ySpanMin, maxLines){
+  var out = [], pool = pts, TOL = 2.2;
+  for(var round=0; round<(maxLines||2) && pool.length>=10; round++){
+    var step = Math.max(1, Math.floor(pool.length/20)), seeds = [];
+    for(var s=0; s<pool.length; s+=step) seeds.push(pool[s]);
+    var best = null;
+    for(var i=0;i<seeds.length;i++){
+      for(var j=i+1;j<seeds.length;j++){
+        var dy = seeds[j].y - seeds[i].y;
+        if(Math.abs(dy) < ySpanMin*0.8) continue;
+        var a = (seeds[j].x - seeds[i].x)/dy;
+        if(!(Math.abs(a) < 2.0)) continue;
+        var b = seeds[i].x - a*seeds[i].y;
+        var cnt=0, yMin=1e9, yMax=-1e9;
+        for(var k=0;k<pool.length;k++){
+          var p = pool[k];
+          if(Math.abs(p.x - (a*p.y + b)) < TOL){
+            cnt++;
+            if(p.y<yMin) yMin=p.y;
+            if(p.y>yMax) yMax=p.y;
+          }
+        }
+        /* Eine kurze helle Stelle laesst sich immer perfekt gerade anpassen.
+           Eine Markierung zieht sich durch den ganzen Suchbereich. */
+        if(cnt>=10 && yMax-yMin>=ySpanMin && (!best || cnt>best.cnt))
+          best = { a:a, b:b, cnt:cnt };
+      }
+    }
+    if(!best) break;
+    var inl = [], rest = [];
+    for(var m=0;m<pool.length;m++){
+      var q = pool[m];
+      (Math.abs(q.x - (best.a*q.y + best.b)) < TOL ? inl : rest).push(q);
+    }
+    var f = lsFit(inl);
+    if(f){ f.n = inl.length; out.push(f); }
+    pool = rest;
   }
-  var f = ls(pts); if(!f) return null;
-  // Ausreisser einmal verwerfen, dann neu anpassen
-  var res = pts.map(function(p){ return Math.abs(p.x - (f.a*p.y + f.b)); });
-  var mean = res.reduce(function(a,b){return a+b;},0)/res.length;
-  var keep = pts.filter(function(p,i){ return res[i] < Math.max(2.5, mean*2.2); });
-  if(keep.length < 6) return null;
-  var f2 = ls(keep) || f;
-  var r2 = keep.map(function(p){ return Math.abs(p.x - (f2.a*p.y + f2.b)); });
-  var err = r2.reduce(function(a,b){return a+b;},0)/r2.length;
-  if(err > 3.0) return null;                        // zu krumm, keine Markierung
-  f2.n = keep.length;
-  return f2;
+  return out;
 }
 
 function laneDetect(fr){
@@ -482,22 +581,36 @@ function laneDetect(fr){
       }
     }
   }
-  var L = fitLine(left), R = fitLine(right);
+  var need = (yBot - yTop) * 0.5;
+  /* Die eigene Fahrspur wird von den INNERSTEN Linien begrenzt. Randlinie,
+     Gegenfahrbahn und Leitplanke liegen weiter aussen und scheiden damit
+     von selbst aus. */
+  var L = null, R = null;
+  findLines(left, need, 2).forEach(function(f){
+    if(!L || f.a*yBot + f.b > L.a*yBot + L.b) L = f;
+  });
+  findLines(right, need, 2).forEach(function(f){
+    if(!R || f.a*yBot + f.b < R.a*yBot + R.b) R = f;
+  });
 
-  /* Plausibilitaet: die beiden Linien muessen sich nach oben annaehern,
-     duerfen sich im Bildausschnitt nicht kreuzen und muessen unten eine
-     Fahrbahnbreite ergeben, die ueberhaupt sein kann. */
-  if(L && R){
-    var spanBot = (R.a*yBot + R.b) - (L.a*yBot + L.b);
-    var spanTop = (R.a*yTop + R.b) - (L.a*yTop + L.b);
-    var bad = spanBot <= W*0.10 ||          // unten zu schmal
-              spanTop <= 2 ||                // oben gekreuzt
-              spanTop >= spanBot ||          // laufen nicht zusammen
-              spanBot > W*1.5;               // unten unmoeglich breit
-    if(bad){ if(L.n >= R.n) R = null; else L = null; }
-  }
-  if(!L && !R) return null;
-  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc, W:W };
+  /* Plausibilitaet. Eine einzelne Linie wird nie mehr gezeigt: in der
+     Daemmerung legt sich sonst eine Baumkante oder die Leitplanke als
+     vermeintliche Markierung quer durchs Bild. Erst wenn beide Seiten da
+     sind, richtig geneigt nach oben zusammenlaufen und sich in einem
+     Fluchtpunkt oberhalb des Suchbereichs nahe der Bildmitte treffen,
+     ist es wirklich eine Fahrspur. */
+  if(!L || !R) return null;
+  var spanBot = (R.a*yBot + R.b) - (L.a*yBot + L.b);
+  var spanTop = (R.a*yTop + R.b) - (L.a*yTop + L.b);
+  if(spanBot < W*0.14 || spanBot > W*1.5) return null;   // unten unmoeglich
+  if(spanTop < 2 || spanTop > spanBot*0.92) return null; // laufen nicht zusammen
+  if(L.a > 0.08 || R.a < -0.08) return null;             // falsch geneigt
+  var den = L.a - R.a;
+  if(Math.abs(den) < 1e-6) return null;
+  var yV = (R.b - L.b)/den, xV = L.a*yV + L.b;           // Fluchtpunkt
+  if(!(yV < yTop) || yV < -H*1.2) return null;
+  if(Math.abs(xV - W/2) > W*0.33) return null;
+  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc, W:W, yV:yV, xV:xV };
 }
 
 function nightDetect(fr){
@@ -614,42 +727,75 @@ function laneDistance(bottomVideoY){
   if(ys < lane.yTop - hgt*0.25 || ys > lane.yBot + 6) return null;
   var span = (lane.R.a*ys + lane.R.b) - (lane.L.a*ys + lane.L.b);
   if(span < 3) return null;
-  var d = focalPx(lane.W, S.fov) * S.laneW / span;
+  // span steckt im verkleinerten Suchbild, deshalb auf Videopixel umrechnen
+  var d = focalVideo() * S.laneW / (span * lane.sc);
   return (d > 2 && d < 150) ? d : null;
 }
 
 async function detectLoop(){
   while(S.running){
     if(video.readyState >= 2){
-      var vw = video.videoWidth || 1, mid = vw/2, band = vw*0.24;
+      var vw = video.videoWidth || 1, vh = video.videoHeight || 1;
+      var mid = vw/2, band = vw*0.30;
+      var tNow = performance.now();
       var list = [], lead = null, nres = null;
 
       // Ein Bild holen, das sich Nachtmodus und Spurerkennung teilen
       var fr = (S.mode !== "day" || S.lanes) ? grabFrame() : null;
       S.lane = (S.lanes && fr) ? laneDetect(fr) : null;
-      if(S.mode !== "day" && fr) nres = nightDetect(fr);
+      if(fr && (S.mode === "night" || (S.mode === "auto" && S.lum < 115)))
+        nres = nightDetect(fr);
+      /* In der Daemmerung ist es fuer das Modell schon zu dunkel, fuer eine
+         Helligkeitsschwelle aber noch zu hell - der Himmel zieht den Mittelwert
+         nach oben. Deshalb zaehlt auch, dass der Tagmodus laengere Zeit nichts
+         findet, waehrend ein Rueckleuchtenpaar deutlich zu sehen ist. */
+      var dusk = S.mode === "auto" && nres && nres.lead &&
+                 (tNow - S.lastDayHit) > 1800;
       var useNight = (S.mode === "night") ||
-                     (S.mode === "auto" && nres && S.lum < 62);
+                     (S.mode === "auto" && nres && (S.lum < 62 || dusk));
       var modeNow = useNight ? "night" : "day";
       if(modeNow !== S.activeMode){ S.activeMode = modeNow; kf.reset(); }
+      S.dusk = useNight && dusk && S.lum >= 62;
 
       if(useNight){
-        list = nres ? nres.all : [];
         lead = nres ? nres.lead : null;
-        if(lead) list = list.concat([lead]);
         S.dets = nres ? nres.all : [];
+        S.win = null;
         lead = pickTarget(lead ? [lead] : [], vw);
+        /* Im Daemmerungsmodus hin und wieder nachsehen, ob das Modell wieder
+           etwas sieht. Ohne das bliebe die App bis zum Ende der Fahrt in der
+           Daemmerung haengen, weil der Tagzweig gar nicht mehr aufgerufen
+           wird und der Zeitzaehler dafuer nie wieder zurueckgesetzt wuerde. */
+        if(dusk && S.model && tNow - S.duskProbe > 6000){
+          S.duskProbe = tNow;
+          var pw = clampWin(vw/2, vh*0.60, Math.min(vw,vh), vw, vh, true), pr = [];
+          try{ pr = await S.model.detect(drawScan(pw), 8); }catch(e){ pr = []; }
+          for(var z=0; z<pr.length; z++)
+            if(VEHICLES[pr[z].class] && pr[z].score >= S.conf){ S.lastDayHit = tNow; break; }
+        }
       } else if(S.model){
-        var preds;
-        try{ preds = await S.model.detect(video, 12); }catch(e){ preds = []; }
+        var win = scanWindow(vw, vh), preds = [];
+        try{ preds = await S.model.detect(drawScan(win), 12); }catch(e){ preds = []; }
+        var kx = win.w/SCAN, ky = win.h/SCAN;
         for(var i=0;i<preds.length;i++){
-          var p = preds[i];
+          var p = preds[i], bb = p.bbox;
           if(!VEHICLES[p.class] || p.score < S.conf) continue;
-          list.push({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3], cls:p.class, score:p.score });
+          /* Am Ausschnittsrand angeschnittene Fahrzeuge erscheinen schmaler
+             als sie sind und wuerden zu weit weg gemessen. Kleine solche Boxen
+             verwerfen; eine grosse heisst, dass jemand dicht davor ist - die
+             bleibt, nur mit ehrlich groesserer Unsicherheit. */
+          var cut = bb[0] < 3 || bb[1] < 3 ||
+                    bb[0]+bb[2] > SCAN-3 || bb[1]+bb[3] > SCAN-3;
+          if(cut && bb[2] < SCAN*0.35) continue;
+          list.push({ x:win.x + bb[0]*kx, y:win.y + bb[1]*ky,
+                      w:bb[2]*kx, h:bb[3]*ky,
+                      cls:p.class, score:p.score, cut:cut });
         }
         S.dets = list;
+        S.win = win;
         var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
         lead = pickTarget(cand, vw);
+        if(lead) S.lastDayHit = tNow;
       } else {
         S.dets = [];
         await new Promise(function(r){ setTimeout(r, 150); });
@@ -662,7 +808,7 @@ async function detectLoop(){
       S.fps = dt > 0 ? (0.8*S.fps + 0.2*(1/dt)) : S.fps;
 
       if(lead){
-        var f = focalPx(vw, S.fov);
+        var f = focalVideo();
 
         /* Massstab aus der Fahrbahnbreite: Dort, wo die Raeder des Vordermanns
            die Fahrbahn beruehren, spannen die Markierungen eine bekannte Breite
@@ -683,10 +829,14 @@ async function detectLoop(){
                   : (lead.cls === "lights" ? S.lightSpan
                   : (S.learnedN >= 10 ? S.learnedW : (REALW[lead.cls] || S.realW)));
         var dRaw = distFromBox(lead.w, realW, f);
-        // Unsicherheit: Boxkanten zittern um etwa zwei Pixel
-        S.err = Math.abs(distFromBox(Math.max(2, lead.w - 2), realW, f) - dRaw);
+        /* Unsicherheit ehrlich angeben: die Boxkanten zittern um gut zwei
+           Pixel; bei einer angeschnittenen Box ist es erheblich mehr. */
+        var wobble = lead.cut ? Math.max(6, lead.w*0.12) : 2;
+        S.err = Math.abs(distFromBox(Math.max(2, lead.w - wobble), realW, f) - dRaw);
         if(S.calibrating){
-          finishCalib(lead.w, vw);
+          finishCalib(lead.w);
+        } else if(!(dRaw > 2.5 && dRaw < 160)){
+          lead = null; S.err = 0;          // unmoeglich - lieber nichts zeigen
         } else {
           kf.update(dRaw, dt);
           lead.dist = kf.d; lead.vRel = kf.v; lead.raw = dRaw;
@@ -747,6 +897,15 @@ function draw(){
     cx.lineCap = "butt";
   }
 
+  /* Der Suchausschnitt, damit auf der Fahrt sichtbar ist, wo die App
+     ueberhaupt hinschaut - und warum sie etwas daneben nicht sieht. */
+  if(S.win){
+    cx.strokeStyle = "rgba(140,152,160,.33)"; cx.lineWidth = 1;
+    cx.setLineDash([5,6]);
+    cx.strokeRect(X(S.win.x), Y(S.win.y), S.win.w*s, S.win.h*s);
+    cx.setLineDash([]);
+  }
+
   cx.lineWidth = 1.5; cx.strokeStyle = "rgba(150,160,165,.5)";
   S.dets.forEach(function(b){
     if(b === S.lead) return;
@@ -801,8 +960,14 @@ function draw(){
   set("d-err", eShow);
   set("d-gap", isFinite(gap) ? fmt(gap,2) : "—", j.c);
 
-  // Akustische Warnung - wichtiger als jede Zahl, weil man hinsehen muesste
-  if(S.lead && isFinite(gap) && gap < S.warnGap){
+  /* Akustische Warnung - wichtiger als jede Zahl, weil man zum Lesen
+     hinsehen muesste. Aber erst, wenn die Messung etwas taugt: ein frisch
+     gefasstes Ziel kann jeden Wert liefern, und ein Fehlalarm alle zehn
+     Sekunden ist schlimmer als gar keiner, weil man dann auch den echten
+     nicht mehr ernst nimmt. */
+  var solide = !!(S.lead && S.lead.dist && S.track && S.track.age >= 3 &&
+                  S.err / S.lead.dist < 0.22);
+  if(solide && isFinite(gap) && gap < S.warnGap){
     beep(gap < S.warnGap*0.65 || (S.lead.vRel < -2 && gap < S.warnGap*1.15));
   }
   set("d-vown", Math.round(vo*3.6) + (S.speedMode==="gps" && S.vOwn!==null ? "" : "*"));
@@ -810,7 +975,7 @@ function draw(){
   set("d-dv", isFinite(dv) ? (dv>=0?"+":"") + fmt(dv,1) : "—", dv < -2 ? "warn" : "");
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
   var modeTxt = S.model || S.activeMode === "night"
-      ? (S.activeMode === "night" ? "Nacht" : "Tag") : "Hand";
+      ? (S.activeMode === "night" ? (S.dusk ? "Dämmerung" : "Nacht") : "Tag") : "Hand";
   if(S.learnedN >= 10) modeTxt += "·Spur";
   set("d-mode", modeTxt);
   /* Empfehlung wie bei einem Abstandsregeltempomaten:
@@ -832,6 +997,10 @@ function draw(){
   if(!S.model && !S.lead){
     ve.textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
     ve.className = "";
+  } else if(S.lead && S.lead.dist && !solide){
+    // Noch kein Urteil faellen, solange das Ziel erst ein, zwei Bilder alt ist
+    ve.textContent = "misst …";
+    ve.className = "";
   } else {
     ve.textContent = j.t + (recWord ? " · " + recWord : "");
     ve.className = j.c;
@@ -845,10 +1014,12 @@ function set(id, val, cls){
 }
 
 /* ---------------- Kalibrierung ---------------- */
-function finishCalib(boxPx, vw){
+function finishCalib(boxPx){
   S.calibrating = false;
   var f = boxPx * S.calDist / S.calWidth;
-  var fov = 2*Math.atan(vw/(2*f))*180/Math.PI;
+  // Der Blickwinkel wird ueber die lange Bildkante angegeben, damit er beim
+  // Drehen des Handys gueltig bleibt.
+  var fov = 2*Math.atan(longSide()/(2*f))*180/Math.PI;
   S.fov = fov;
   document.getElementById("i-fov").value = fov.toFixed(1);
   document.getElementById("l-fov").textContent = fov.toFixed(1) + "°";
@@ -886,8 +1057,8 @@ function mMove(e){
 function mEnd(){
   mDrag = null;
   if(S.manual && S.manual.w > 4){
-    var f = focalPx(video.videoWidth || 1, S.fov);
-    if(S.calibrating){ finishCalib(S.manual.w, video.videoWidth || 1); S.manual = null; return; }
+    var f = focalVideo();
+    if(S.calibrating){ finishCalib(S.manual.w); S.manual = null; return; }
     S.manual.dist = distFromBox(S.manual.w, S.realW, f);
     S.lead = S.manual;
   }
@@ -903,6 +1074,7 @@ cv.addEventListener("touchend", mEnd);
 document.getElementById("b-start").addEventListener("click", start);
 document.getElementById("b-set").addEventListener("click", function(){
   document.getElementById("settings").hidden = false;
+  showOptik();
 });
 document.getElementById("b-close").addEventListener("click", function(){
   document.getElementById("settings").hidden = true;
@@ -922,9 +1094,27 @@ document.getElementById("b-calgo").addEventListener("click", function(){
   document.getElementById("calib").hidden = true;
 });
 
+/* Zum Nachsehen, ob die Optik stimmt: Bildformat, Brennweite und der
+   Blickwinkel, der sich daraus quer ueber das Bild tatsaechlich ergibt. */
+function showOptik(){
+  var el = document.getElementById("l-optik");
+  if(!el) return;
+  var vw = video.videoWidth, vh = video.videoHeight;
+  if(!vw){ el.textContent = "Kamera läuft noch nicht."; return; }
+  var f = focalVideo();
+  var quer = 2*Math.atan(vw/(2*f))*180/Math.PI;
+  el.innerHTML = "Bild " + vw + "×" + vh + " px · " +
+    (vh > vw ? "hochkant" : "quer") + " · Brennweite " + Math.round(f) + " px<br>" +
+    "quer über das Bild sind das " + quer.toFixed(1) + "°" +
+    (S.backend ? " · Rechenwerk " + S.backend : "");
+}
 document.getElementById("i-fov").addEventListener("input", function(){
   S.fov = +this.value;
   document.getElementById("l-fov").textContent = (+this.value).toFixed(1) + "°";
+  showOptik();
+});
+document.getElementById("i-boost").addEventListener("change", function(){
+  S.boost = this.value === "1";
 });
 document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
 document.getElementById("i-mode").addEventListener("change", function(){ S.mode = this.value; kf.reset(); });
