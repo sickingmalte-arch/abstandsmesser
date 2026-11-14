@@ -210,6 +210,14 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.30</b></label>
     <input type="range" id="i-conf" min="0.15" max="0.8" step="0.05" value="0.30">
 
+    <label for="i-takt">Takt der Auswertung</label>
+    <select id="i-takt">
+      <option value="0" selected>so schnell wie möglich</option>
+      <option value="300">sparsam — etwa 3 je Sekunde</option>
+      <option value="500">sehr sparsam — etwa 2 je Sekunde</option>
+    </select>
+    <p class="hint">Jede Auswertung wird im Handy zu Wärme. Wird es heiß, drosselt Android von selbst — dann bricht die Bildrate gerade dann ein, wenn du sie brauchst. Ladekabel abziehen und Helligkeit runter hilft zusätzlich.</p>
+
     <label for="i-boost">Gegenlichtausgleich</label>
     <select id="i-boost">
       <option value="1" selected>an — mehr Kontrast für die Erkennung</option>
@@ -295,7 +303,7 @@ function judge(g){
 var S = {
   fov:69.7, realW:1.80, conf:0.30, boost:true,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
-  win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"",
+  win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"", minPeriod:0,
   lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
@@ -480,15 +488,30 @@ function motionRows(gray, W, H){
   if(!prevGray) prevGray = new Uint8Array(gray.length);
   prevGray.set(gray);
 }
-function roadBottom(H){
-  var vor = Math.round(H*0.94);
+function roadBand(H){
+  var vor = [Math.round(H*0.49), Math.round(H*0.94)];
   if(!rowMove || rowMove.length !== H) return vor;
   var mx = 0, y;
   for(y=0;y<H;y++) if(rowMove[y] > mx) mx = rowMove[y];
-  if(mx < 1.2) return vor;                       // steht, oder zu dunkel
-  var thr = mx*0.25, unterste = Math.round(H*0.50);
-  for(y = vor; y > unterste; y--) if(rowMove[y] > thr) return y;
-  return vor;
+  /* Die Schwelle muss niedrig liegen: auf glattem, dunklem Asphalt aendern
+     sich beim Vorbeiziehen kaum Grauwerte - an einer echten Daemmerungs-
+     aufnahme gemessen gerade einmal ein Grauwert. Steht das Auto, ist
+     ueberall nur Rauschen, alle Zeilen liegen gleichauf, und die Suche
+     faellt von selbst auf die festen Kanten zurueck. */
+  if(mx < 0.35) return vor;
+  /* Die Bewegung waechst mit dem Kehrwert des Abstandsquadrats: nahe
+     Fahrbahn rauscht vorbei, ferner Horizont steht fast, Himmel steht ganz,
+     Armaturenbrett steht ohnehin. Damit sagt dasselbe Profil beides - wo
+     die Fahrbahn aufhoert und wo sie anfaengt. Ohne die obere Kante geraet
+     bei steil gerichteter Kamera eine Baumallee in den Suchstreifen, und
+     deren Staemme sind laenger und gerader als jede Markierung. */
+  var thr = mx*0.18, u = -1, o = -1;
+  for(y = vor[1]; y > Math.round(H*0.25); y--) if(rowMove[y] > thr){ u = y; break; }
+  if(u < 0) return vor;
+  for(y = 0; y <= u; y++) if(rowMove[y] > thr){ o = y; break; }
+  if(o < 0 || u - o < Math.round(H*0.05)) return vor;
+  o = Math.max(0, o - Math.round(H*0.04));       // etwas Luft fuer den Fluchtpunkt
+  return [o, u];
 }
 
 /* --- Suchausschnitt fuer die Objekterkennung ---
@@ -650,9 +673,8 @@ function laneDetect(fr){
   /* Der Suchstreifen haengt an der Unterkante der Fahrbahn, nicht an einer
      festen Bildhoehe. Steht das Handy steil und das Brett ragt weit herein,
      wandert der ganze Streifen mit nach oben. */
-  var yBot = roadBottom(H);
-  var yTop = Math.max(Math.round(H*0.20), yBot - Math.round(H*0.45));
-  if(yBot - yTop < Math.round(H*0.12)) return null;
+  var bd = roadBand(H), yTop = bd[0], yBot = bd[1];
+  if(yBot - yTop < Math.round(H*0.07)) return null;
   S.roadBot = yBot;
   var left = [], right = [];
   for(var y = yTop; y < yBot; y += 2){
@@ -738,6 +760,14 @@ function laneDetect(fr){
     return { L:L, R:R, yV:yV, xV:xV, hoehe:hoehe,
              wert: Math.abs(hoehe - 1.3) + Math.abs(frac - 0.5)*2 };
   }
+
+  /* Kleine Nachschau: woran es liegt, wenn keine Spur erscheint - zu wenig
+     helle Punkte, keine durchgehende Linie, oder ein Paar, das keine Spur
+     sein kann. Steht in den Einstellungen. */
+  S.laneDbg = { punkte:[left.length, right.length], linien:[kandL.length, kandR.length],
+                band:[yTop, yBot],
+                a:[kandL.map(function(f){return +f.a.toFixed(2);}),
+                   kandR.map(function(f){return +f.a.toFixed(2);})] };
 
   var best = null;
   for(var li=0; li<kandL.length; li++){
@@ -881,6 +911,7 @@ function laneDistance(bottomVideoY){
 
 async function detectLoop(){
   while(S.running){
+    var tLoop = performance.now();
     if(video.readyState >= 2){
       var vw = video.videoWidth || 1, vh = video.videoHeight || 1;
       var mid = vw/2, band = vw*0.30;
@@ -999,7 +1030,12 @@ async function detectLoop(){
       }
       S.lead = lead;
     }
-    await new Promise(function(r){ setTimeout(r, 1); });
+    /* Takt begrenzen. Jede Auswertung ist Rechenarbeit, und die wird im Handy
+       zu Waerme - ist es erst heiss, drosselt Android von selbst, und dann
+       sinkt die Bildrate gerade dann, wenn man sie braucht. Wer weniger
+       Bilder je Sekunde hinnimmt, bleibt kuehler und am Ende oft schneller. */
+    var rest = S.minPeriod - (performance.now() - tLoop);
+    await new Promise(function(r){ setTimeout(r, rest > 1 ? rest : 1); });
   }
 }
 
@@ -1268,6 +1304,9 @@ document.getElementById("i-fov").addEventListener("input", function(){
 });
 document.getElementById("i-boost").addEventListener("change", function(){
   S.boost = this.value === "1";
+});
+document.getElementById("i-takt").addEventListener("change", function(){
+  S.minPeriod = +this.value;
 });
 document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
 document.getElementById("i-mode").addEventListener("change", function(){ S.mode = this.value; kf.reset(); });
