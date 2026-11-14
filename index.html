@@ -218,9 +218,11 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
 
     <div class="btns">
       <button class="pri" id="b-close">Zurück</button>
-      <button id="b-csv">Aufzeichnung speichern</button>
+      <button id="b-csv">Als Datei sichern</button>
+      <button id="b-share">Teilen</button>
     </div>
     <p class="hint" id="recinfo">Noch nichts aufgezeichnet.</p>
+    <div class="hint" id="bilanz" hidden></div>
   </div>
 </div>
 
@@ -1165,20 +1167,107 @@ document.getElementById("b-rec").addEventListener("click", function(){
   S.rec = !S.rec;
   this.textContent = S.rec ? "Aufzeichnung läuft" : "Aufzeichnen";
   this.className = S.rec ? "pri" : "";
-  if(S.rec) S.log = [];
+  if(S.rec){ S.log = []; document.getElementById("bilanz").hidden = true; }
   document.getElementById("recinfo").textContent =
     S.rec ? "Aufzeichnung läuft …" : (S.log.length + " Messpunkte aufgezeichnet.");
+  if(!S.rec) zeigeBilanz();     // beim Stoppen gleich die Kurzfassung zeigen
 });
+
+/* ---------------- Aufzeichnung herausbekommen ----------------
+   Eine stille Datei im Downloadordner nuetzt nichts, wenn man sie hinterher
+   nicht wiederfindet. Deshalb drei Wege: eine Kurzfassung direkt auf dem
+   Bildschirm, die man notfalls einfach abfotografiert, der Teilen-Dialog
+   des Handys, und erst zuletzt die Datei. */
+function csvText(){
+  var f = focalVideo();
+  var kopf =
+    "# Abstandsmesser, Aufzeichnung\n" +
+    "# bild=" + (video.videoWidth||0) + "x" + (video.videoHeight||0) +
+      " lage=" + ((video.videoHeight||0) > (video.videoWidth||0) ? "hochkant" : "quer") + "\n" +
+    "# blickwinkel_lange_kante=" + S.fov.toFixed(1) +
+      " brennweite_px=" + Math.round(f) + "\n" +
+    "# fahrzeugbreite=" + (S.learnedN >= 10 ? S.learnedW.toFixed(3) + " (aus der Spur gelernt)"
+                                            : S.realW.toFixed(2) + " (angenommen)") + "\n" +
+    "# tempoquelle=" + (S.speedMode === "gps" ? "GPS" : "von Hand " + S.manSpeed) +
+      " wunschtempo=" + S.vSet + " zielluecke=" + S.gapTarget + "\n" +
+    "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
+  return kopf + S.log.map(function(r){ return r.join(","); }).join("\n");
+}
+
+function bilanz(){
+  var L = S.log;
+  if(!L.length) return null;
+  var num = function(i){
+    return L.map(function(r){ return +r[i]; }).filter(function(x){ return isFinite(x); })
+            .sort(function(a,b){ return a-b; });
+  };
+  var d = num(3), g = num(7), v = num(5), px = num(1);
+  var med = function(x){ return x.length ? x[(x.length/2)|0] : NaN; };
+  var unter = g.filter(function(x){ return x < 1.8; }).length;
+  return {
+    n: L.length,
+    dauer: (+L[L.length-1][0]) - (+L[0][0]),
+    dMin: d[0], dMed: med(d), dMax: d[d.length-1],
+    gMin: g[0], gMed: med(g),
+    unter: g.length ? unter/g.length : 0,
+    vMed: med(v), pxMed: med(px)
+  };
+}
+
+function zeigeBilanz(){
+  var el = document.getElementById("bilanz"), b = bilanz();
+  if(!b){ el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML =
+    "<strong>Kurzfassung</strong> — notfalls einfach abfotografieren<br>" +
+    "Dauer " + Math.round(b.dauer) + " s · " + b.n + " Messpunkte · " +
+      "Tempo im Mittel " + Math.round(b.vMed) + " km/h<br>" +
+    "Abstand " + fmt(b.dMin,0) + " bis " + fmt(b.dMax,0) + " m, mittig " + fmt(b.dMed,0) + " m<br>" +
+    "Zeitlücke mittig " + fmt(b.gMed,2) + " s, knappste " + fmt(b.gMin,2) + " s<br>" +
+    "unter halbem Tacho: " + Math.round(b.unter*100) + " % der Zeit<br>" +
+    "Box im Mittel " + fmt(b.pxMed,0) + " px · Brennweite " + Math.round(focalVideo()) + " px · " +
+      (video.videoWidth||0) + "×" + (video.videoHeight||0);
+}
 
 document.getElementById("b-csv").addEventListener("click", function(){
   if(!S.log.length){ document.getElementById("recinfo").textContent = "Noch nichts aufgezeichnet."; return; }
-  var kopf = "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
-  var text = kopf + S.log.map(function(r){ return r.join(","); }).join("\n");
-  var url = URL.createObjectURL(new Blob([text], {type:"text/csv"}));
+  var url = URL.createObjectURL(new Blob([csvText()], {type:"text/csv"}));
   var a = document.createElement("a");
-  a.href = url; a.download = "fahrt.csv"; a.click();
-  setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
-  document.getElementById("recinfo").textContent = S.log.length + " Messpunkte gespeichert.";
+  a.href = url; a.download = "fahrt.csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+  document.getElementById("recinfo").textContent =
+    S.log.length + " Messpunkte als fahrt.csv im Downloadordner.";
+  zeigeBilanz();
+});
+
+document.getElementById("b-share").addEventListener("click", async function(){
+  var info = document.getElementById("recinfo");
+  if(!S.log.length){ info.textContent = "Noch nichts aufgezeichnet."; return; }
+  zeigeBilanz();
+  var txt = csvText();
+  try{
+    var file = new File([txt], "fahrt.csv", { type:"text/csv" });
+    if(navigator.canShare && navigator.canShare({ files:[file] })){
+      await navigator.share({ files:[file], title:"Abstandsmesser, Aufzeichnung" });
+      info.textContent = "Aufzeichnung geteilt.";
+      return;
+    }
+    if(navigator.share){
+      await navigator.share({ title:"Abstandsmesser", text:txt.slice(0, 4000) });
+      info.textContent = "Aufzeichnung als Text geteilt.";
+      return;
+    }
+    throw new Error("kein Teilen");
+  }catch(e){
+    if(e && e.name === "AbortError"){ info.textContent = "Teilen abgebrochen."; return; }
+    try{
+      await navigator.clipboard.writeText(txt);
+      info.textContent = "Teilen geht hier nicht — die Aufzeichnung liegt jetzt in der Zwischenablage.";
+    }catch(e2){
+      info.textContent = "Teilen geht hier nicht. Nimm „Als Datei sichern“ oder fotografiere die Kurzfassung ab.";
+    }
+  }
 });
 </script>
 </body>
