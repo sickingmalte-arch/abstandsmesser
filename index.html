@@ -456,7 +456,39 @@ function grabFrame(){
     gray[i] = v; lum += v;
   }
   S.lum = lum / n;
+  motionRows(gray, W, H);
   return { px:px, gray:gray, W:W, H:H, sc:vw/W };
+}
+
+/* --- Wo im Bild ist ueberhaupt Fahrbahn? ---
+   Das Armaturenbrett steht still, die Fahrbahn zieht vorbei. Der Unterschied
+   zwischen zwei Bildern verraet das zuverlaessiger als jede feste Grenze:
+   wo sich ueber die Zeit nichts tut, ist kein Verkehrsraum. Je nachdem, wie
+   steil das Handy steht, ragt das Brett mal kaum, mal bis zur Bildmitte
+   herein - mit einer festen Unterkante faende die Spurerkennung bei hoch
+   gerichteter Kamera nie genug Markierung. */
+var prevGray = null, rowMove = null;
+function motionRows(gray, W, H){
+  if(!rowMove || rowMove.length !== H){ rowMove = new Float32Array(H); prevGray = null; }
+  if(prevGray){
+    for(var y=0;y<H;y++){
+      var row = y*W, s = 0, c = 0;
+      for(var x=0;x<W;x+=2){ s += Math.abs(gray[row+x] - prevGray[row+x]); c++; }
+      rowMove[y] = rowMove[y]*0.86 + (s/c)*0.14;
+    }
+  }
+  if(!prevGray) prevGray = new Uint8Array(gray.length);
+  prevGray.set(gray);
+}
+function roadBottom(H){
+  var vor = Math.round(H*0.94);
+  if(!rowMove || rowMove.length !== H) return vor;
+  var mx = 0, y;
+  for(y=0;y<H;y++) if(rowMove[y] > mx) mx = rowMove[y];
+  if(mx < 1.2) return vor;                       // steht, oder zu dunkel
+  var thr = mx*0.25, unterste = Math.round(H*0.50);
+  for(y = vor; y > unterste; y--) if(rowMove[y] > thr) return y;
+  return vor;
 }
 
 /* --- Suchausschnitt fuer die Objekterkennung ---
@@ -525,7 +557,46 @@ function lsFit(list){
    Geradenvorschlaege gebildet, der mit den meisten Stuetzpunkten behalten,
    dessen Punkte herausgenommen und noch einmal gesucht. Die Paare werden fest
    abgezaehlt, nicht gewuerfelt: dasselbe Bild soll dasselbe Ergebnis geben. */
-function findLines(pts, ySpanMin, maxLines){
+/* --- Wo ist die Linie wirklich belegt? ---
+   Einzelne helle Flecken im Blattwerk liegen zufaellig auf der Geraden und
+   wuerden die gruene Linie nach oben in die Baeume ziehen. Eine Markierung
+   unterscheidet sich davon durch die Dichte: eine gestrichelte belegt gut
+   ein Drittel ihrer Zeilen, eine durchgezogene fast alle, verstreute
+   Flecken nur einen Bruchteil. Gesucht wird der laengste Abschnitt, in dem
+   die Belegung ueber dieser Schwelle liegt. */
+function dichteSpanne(inl, schritt){
+  var a0 = 1e9, a1 = -1e9, i;
+  for(i=0;i<inl.length;i++){
+    if(inl[i].y < a0) a0 = inl[i].y;
+    if(inl[i].y > a1) a1 = inl[i].y;
+  }
+  var n = Math.floor((a1 - a0)/schritt) + 1;
+  if(n < 6) return { y0:a0, y1:a1 };
+  var hat = new Uint8Array(n);
+  for(i=0;i<inl.length;i++){
+    var k = Math.round((inl[i].y - a0)/schritt);
+    if(k >= 0 && k < n) hat[k] = 1;
+  }
+  var ps = new Int32Array(n+1);
+  for(i=0;i<n;i++) ps[i+1] = ps[i] + hat[i];
+  var fen = 14, best = null, s = -1;      // Fenster gut ueber eine Strichlaenge
+  for(i=0;i<=n;i++){
+    var dicht = false;
+    if(i < n){
+      var a = Math.max(0, i-fen), b = Math.min(n, i+fen+1);
+      dicht = (ps[b]-ps[a])/(b-a) >= 0.30;
+    }
+    if(dicht){ if(s < 0) s = i; }
+    else if(s >= 0){
+      if(!best || i-1-s > best[1]-best[0]) best = [s, i-1];
+      s = -1;
+    }
+  }
+  if(!best) return null;                  // nirgends dicht: keine Markierung
+  return { y0: a0 + best[0]*schritt, y1: a0 + best[1]*schritt };
+}
+
+function findLines(pts, ySpanMin, maxLines, schritt){
   var out = [], pool = pts, TOL = 2.2;
   for(var round=0; round<(maxLines||2) && pool.length>=10; round++){
     var step = Math.max(1, Math.floor(pool.length/20)), seeds = [];
@@ -559,8 +630,15 @@ function findLines(pts, ySpanMin, maxLines){
       var q = pool[m];
       (Math.abs(q.x - (best.a*q.y + best.b)) < TOL ? inl : rest).push(q);
     }
-    var f = lsFit(inl);
-    if(f){ f.n = inl.length; out.push(f); }
+    /* Nur ueber den dicht belegten Abschnitt darf die Linie spaeter
+       gezeichnet werden - alles andere waere eine Behauptung ueber
+       Bildteile, in denen gar keine Markierung liegt. */
+    var sp = dichteSpanne(inl, schritt || 2);
+    var f = sp ? lsFit(inl) : null;
+    if(f && sp.y1 - sp.y0 >= ySpanMin*0.6){
+      f.n = inl.length; f.y0 = sp.y0; f.y1 = sp.y1;
+      out.push(f);
+    }
     pool = rest;
   }
   return out;
@@ -569,15 +647,26 @@ function findLines(pts, ySpanMin, maxLines){
 function laneDetect(fr){
   if(!fr) return null;
   var W = fr.W, H = fr.H, g = fr.gray;
-  var yTop = Math.round(H*0.56), yBot = Math.round(H*0.94);
+  /* Der Suchstreifen haengt an der Unterkante der Fahrbahn, nicht an einer
+     festen Bildhoehe. Steht das Handy steil und das Brett ragt weit herein,
+     wandert der ganze Streifen mit nach oben. */
+  var yBot = roadBottom(H);
+  var yTop = Math.max(Math.round(H*0.20), yBot - Math.round(H*0.45));
+  if(yBot - yTop < Math.round(H*0.12)) return null;
+  S.roadBot = yBot;
   var left = [], right = [];
   for(var y = yTop; y < yBot; y += 2){
     var row = y*W, sum = 0, cnt = 0;
     for(var x = 0; x < W; x++){ sum += g[row+x]; cnt++; }
     var base = sum/cnt, thr = base + S.laneThr;
     // Perspektive: weiter oben liegen die Markierungen dichter an der Mitte
+    /* Nach unten hin laufen die Markierungen zu den Bildraendern hin
+       auseinander, nach oben zur Mitte. Das Fenster darf aber nicht zu eng
+       sein: wo genau der Horizont im Bild liegt, haengt an der Neigung des
+       Handys, und ein zu enges Fenster verfehlt die Markierung schon bei
+       geringer Abweichung komplett. */
     var frac = (y - yTop) / Math.max(1, yBot - yTop);
-    var span = W * (0.08 + 0.42*frac);
+    var span = W * Math.min(0.5, 0.20 + 0.75*frac);
     var x0 = Math.max(1, Math.round(W/2 - span)), x1 = Math.min(W-2, Math.round(W/2 + span));
     var runStart = -1, maxRun = Math.max(2, Math.round(W*0.035));
     for(var xx = x0; xx <= x1; xx++){
@@ -593,36 +682,74 @@ function laneDetect(fr){
       }
     }
   }
-  var need = (yBot - yTop) * 0.5;
-  /* Die eigene Fahrspur wird von den INNERSTEN Linien begrenzt. Randlinie,
-     Gegenfahrbahn und Leitplanke liegen weiter aussen und scheiden damit
-     von selbst aus. */
-  var L = null, R = null;
-  findLines(left, need, 2).forEach(function(f){
-    if(!L || f.a*yBot + f.b > L.a*yBot + L.b) L = f;
-  });
-  findLines(right, need, 2).forEach(function(f){
-    if(!R || f.a*yBot + f.b < R.a*yBot + R.b) R = f;
-  });
+  /* Mindestlaenge einer Markierung. Nicht an den Suchstreifen koppeln:
+     bei steil gerichteter Kamera ist dessen obere Haelfte Himmel, und eine
+     Markierung kann dort gar nicht so lang sein. Kurze helle Flecken haelt
+     ohnehin die Dichtepruefung ab. */
+  var need = Math.max(24, Math.round(H * 0.06));
+  /* Nur Linien zaehlen, deren Belegung bis in den unteren Teil des Bildes
+     reicht. Die Markierungen der eigenen Spur laufen bis dicht ans Auto
+     heran; eine Baumkante oben am Horizont tut das nicht. */
+  var schlupf = (yBot - yTop)*0.25;
+  function reichtRunter(f){
+    /* Wie weit unten koennte diese Linie ueberhaupt noch im Bild sein? Eine
+       Markierung laeuft nach unten auseinander und verlaesst das Bild oft
+       seitlich, bevor der Suchstreifen zu Ende ist. */
+    var yRand = Math.abs(f.a) < 1e-6 ? yBot
+              : (f.a < 0 ? (0 - f.b)/f.a : (W - f.b)/f.a);
+    if(!(yRand > 0)) yRand = yBot;
+    return f.y1 >= Math.min(yBot, yRand) - schlupf;
+  }
+  var kandL = findLines(left,  need, 2, 2).filter(function(f){ return reichtRunter(f) && f.a <=  0.08; });
+  var kandR = findLines(right, need, 2, 2).filter(function(f){ return reichtRunter(f) && f.a >= -0.08; });
+  if(!kandL.length || !kandR.length) return null;
 
-  /* Plausibilitaet. Eine einzelne Linie wird nie mehr gezeigt: in der
-     Daemmerung legt sich sonst eine Baumkante oder die Leitplanke als
-     vermeintliche Markierung quer durchs Bild. Erst wenn beide Seiten da
-     sind, richtig geneigt nach oben zusammenlaufen und sich in einem
-     Fluchtpunkt oberhalb des Suchbereichs nahe der Bildmitte treffen,
-     ist es wirklich eine Fahrspur. */
-  if(!L || !R) return null;
-  var spanBot = (R.a*yBot + R.b) - (L.a*yBot + L.b);
-  var spanTop = (R.a*yTop + R.b) - (L.a*yTop + L.b);
-  if(spanBot < W*0.14 || spanBot > W*1.5) return null;   // unten unmoeglich
-  if(spanTop < 2 || spanTop > spanBot*0.92) return null; // laufen nicht zusammen
-  if(L.a > 0.08 || R.a < -0.08) return null;             // falsch geneigt
-  var den = L.a - R.a;
-  if(Math.abs(den) < 1e-6) return null;
-  var yV = (R.b - L.b)/den, xV = L.a*yV + L.b;           // Fluchtpunkt
-  if(!(yV < yTop) || yV < -H*1.2) return null;
-  if(Math.abs(xV - W/2) > W*0.33) return null;
-  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc, W:W, yV:yV, xV:xV };
+  /* Nicht die innerste Linie je Seite nehmen - eine flachere Baumkante liegt
+     unten im Bild weiter innen als die echte Markierung und wuerde gewinnen.
+     Stattdessen jedes Paar daraufhin pruefen, ob es ueberhaupt eine Fahrspur
+     sein KANN, und das physikalisch stimmigste nehmen. */
+  function bewerte(L, R){
+    /* Beurteilt wird dort, wo beide Markierungen tatsaechlich gesehen wurden,
+       nicht an den Raendern des Suchstreifens: sonst haengt das Urteil an der
+       Neigung des Handys. */
+    var oY = Math.max(L.y0, R.y0), uY = Math.min(L.y1, R.y1);
+    if(uY - oY < need*0.45) return null;                 // kaum Ueberschneidung
+    var spanU = (R.a*uY + R.b) - (L.a*uY + L.b);
+    var spanO = (R.a*oY + R.b) - (L.a*oY + L.b);
+    if(spanU < W*0.10 || spanU > W*1.5) return null;     // unten unmoeglich
+    if(spanO < 2 || spanO > spanU*0.92) return null;     // laufen nicht zusammen
+    /* Auf ebener Fahrbahn ist die Steigung einer Markierung im Bild ihr
+       seitlicher Abstand geteilt durch die Kamerahoehe - beides in Metern,
+       das Ergebnis einheitenlos und direkt in Pixeln ablesbar. Aus beiden
+       Steigungen und der Fahrstreifenbreite folgt damit, wie hoch die Kamera
+       haengt. Kommt etwas heraus, das kein Auto sein kann, war eine der
+       Linien eine Leitplanke oder eine Baumreihe weiter aussen. */
+    var hoehe = S.laneW / (R.a - L.a);
+    if(!(hoehe > 0.9 && hoehe < 2.2)) return null;
+    // Man faehrt in seiner Spur, nicht daneben
+    var mY = (oY + uY)/2, xl = L.a*mY + L.b, xr = R.a*mY + R.b;
+    var frac = (W/2 - xl) / Math.max(1e-6, xr - xl);
+    if(!(frac > 0.15 && frac < 0.85)) return null;
+    var den = L.a - R.a;
+    if(Math.abs(den) < 1e-6) return null;
+    var yV = (R.b - L.b)/den, xV = L.a*yV + L.b;         // Fluchtpunkt
+    if(!(yV < oY) || yV < -H*1.2) return null;           // muss oberhalb liegen
+    if(Math.abs(xV - W/2) > W*0.33) return null;
+    return { L:L, R:R, yV:yV, xV:xV, hoehe:hoehe,
+             wert: Math.abs(hoehe - 1.3) + Math.abs(frac - 0.5)*2 };
+  }
+
+  var best = null;
+  for(var li=0; li<kandL.length; li++){
+    for(var ri=0; ri<kandR.length; ri++){
+      var pr = bewerte(kandL[li], kandR[ri]);
+      if(pr && (!best || pr.wert < best.wert)) best = pr;
+    }
+  }
+  if(!best) return null;
+  S.camH = best.hoehe;
+  return { L:best.L, R:best.R, yTop:yTop, yBot:yBot, sc:fr.sc, W:W,
+           yV:best.yV, xV:best.xV };
 }
 
 function nightDetect(fr){
@@ -735,10 +862,18 @@ function pickTarget(cands, vw){
 function laneDistance(bottomVideoY){
   var lane = S.lane;
   if(!lane || !lane.L || !lane.R) return null;
-  var ys = bottomVideoY / lane.sc, hgt = lane.yBot - lane.yTop;
-  if(ys < lane.yTop - hgt*0.25 || ys > lane.yBot + 6) return null;
+  /* Gueltig von knapp unter dem Fluchtpunkt - darueber gibt es keine
+     Fahrbahn mehr - bis zum unteren Ende der gefundenen Markierung. */
+  var ys = bottomVideoY / lane.sc;
+  var oben = Math.max(lane.L.y0, lane.R.y0), unten = Math.min(lane.L.y1, lane.R.y1);
+  /* Nahe am Fluchtpunkt geht die Fahrbahnbreite im Bild gegen null. Dort
+     wird aus einem Pixel Anpassungsfehler ein grosser Abstandsfehler, und
+     eine daraus gelernte Fahrzeugbreite verdirbt anschliessend jede weitere
+     Messung. Also nur dort messen, wo die Spur breit genug im Bild steht
+     und die Markierungen auch tatsaechlich gesehen wurden. */
+  if(ys < oben - (unten - oben)*0.3 || ys > unten + 6) return null;
   var span = (lane.R.a*ys + lane.R.b) - (lane.L.a*ys + lane.L.b);
-  if(span < 3) return null;
+  if(span < lane.W*0.15) return null;
   // span steckt im verkleinerten Suchbild, deshalb auf Videopixel umrechnen
   var d = focalVideo() * S.laneW / (span * lane.sc);
   return (d > 2 && d < 150) ? d : null;
@@ -893,17 +1028,23 @@ function draw(){
   if(S.lane){
     var lane = S.lane, k = lane.sc;
     var pt = function(f, yy){ return { x:X((f.a*yy + f.b)*k), y:Y(yy*k) }; };
-    if(lane.L && lane.R){
-      var l0=pt(lane.L,lane.yBot), l1=pt(lane.L,lane.yTop),
-          r0=pt(lane.R,lane.yBot), r1=pt(lane.R,lane.yTop);
+    /* Jede Linie nur so weit zeichnen, wie die Markierung tatsaechlich
+       gefunden wurde, und nie oberhalb des Fluchtpunkts. Sonst laeuft das
+       Gruen oben in die Baeume und unten ueber das Armaturenbrett. */
+    var kopf = lane.yV + 3;
+    var lo = Math.max(lane.L.y0, kopf), lu = lane.L.y1;
+    var ro = Math.max(lane.R.y0, kopf), ru = lane.R.y1;
+    var o = Math.max(lo, ro), u = Math.min(lu, ru);
+    if(u > o){
+      var l0=pt(lane.L,u), l1=pt(lane.L,o), r0=pt(lane.R,u), r1=pt(lane.R,o);
       cx.fillStyle = "rgba(53,208,127,.13)";
       cx.beginPath(); cx.moveTo(l0.x,l0.y); cx.lineTo(l1.x,l1.y);
       cx.lineTo(r1.x,r1.y); cx.lineTo(r0.x,r0.y); cx.closePath(); cx.fill();
     }
     cx.strokeStyle = "#35D07F"; cx.lineWidth = 5; cx.lineCap = "round";
-    [lane.L, lane.R].forEach(function(f){
-      if(!f) return;
-      var a0 = pt(f, lane.yBot), a1 = pt(f, lane.yTop);
+    [[lane.L, lo, lu], [lane.R, ro, ru]].forEach(function(e){
+      if(!e[0] || !(e[2] > e[1])) return;
+      var a0 = pt(e[0], e[2]), a1 = pt(e[0], e[1]);
       cx.beginPath(); cx.moveTo(a0.x, a0.y); cx.lineTo(a1.x, a1.y); cx.stroke();
     });
     cx.lineCap = "butt";
