@@ -98,6 +98,7 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <div class="cell"><div class="k">v vorn</div><div class="v" id="d-vlead">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">Δv</div><div class="v" id="d-dv">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
+      <div class="cell"><div class="k">Modus</div><div class="v" id="d-mode" style="font-size:.95rem">—</div></div>
     </div>
     <div id="verdict"></div>
   </div>
@@ -145,8 +146,21 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <label for="i-fov">Blickwinkel der Kamera <b id="l-fov">69.7°</b></label>
     <input type="range" id="i-fov" min="30" max="110" step="0.1" value="69.7">
 
-    <label for="i-width">Angenommene Fahrzeugbreite in m</label>
+    <label for="i-mode">Erkennung</label>
+    <select id="i-mode">
+      <option value="auto">automatisch nach Helligkeit</option>
+      <option value="day">Tag — Fahrzeugumriss</option>
+      <option value="night">Nacht — Rückleuchten</option>
+    </select>
+
+    <label for="i-width">Angenommene Fahrzeugbreite in m <b>Tag</b></label>
     <input type="number" id="i-width" value="1.80" min="0.5" max="3" step="0.01">
+
+    <label for="i-span">Rückleuchtenabstand, Mitte zu Mitte, in m <b>Nacht</b></label>
+    <input type="number" id="i-span" value="1.35" min="0.5" max="3" step="0.01">
+
+    <label for="i-red">Empfindlichkeit für Rot <b id="l-red">80</b></label>
+    <input type="range" id="i-red" min="40" max="180" step="5" value="80">
 
     <label for="i-speed">Eigene Geschwindigkeit</label>
     <select id="i-speed">
@@ -220,6 +234,7 @@ function judge(g){
 /* ---------------- Zustand ---------------- */
 var S = {
   fov:69.7, realW:1.80, conf:0.45,
+  mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
   speedMode:"gps", manSpeed:100,
   vOwn:null, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -299,23 +314,121 @@ function ownSpeed(){
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
+/* --- Nachtmodus: Rueckleuchtenpaare statt Objekterkennung ---
+   Nachts ist vom Vordermann praktisch nur ein Paar roter Lichter zu sehen.
+   Deren Mittenabstand ist die Referenzbreite. Braucht kein neuronales Netz,
+   nur eine Farbschwelle und das Zusammenfassen zusammenhaengender Flaechen. */
+var nCv = document.createElement("canvas");
+var nCx = nCv.getContext("2d", { willReadFrequently:true });
+
+function nightDetect(){
+  var vw = video.videoWidth, vh = video.videoHeight;
+  if(!vw) return null;
+  var W = 320, H = Math.max(1, Math.round(vh * W / vw));
+  if(nCv.width !== W || nCv.height !== H){ nCv.width = W; nCv.height = H; }
+  nCx.drawImage(video, 0, 0, W, H);
+  var px;
+  try{ px = nCx.getImageData(0, 0, W, H).data; }catch(e){ return null; }
+
+  var n = W*H, mask = new Uint8Array(n), lum = 0, thr = S.redMin;
+  for(var i=0, j=0; i<n; i++, j+=4){
+    var r=px[j], g=px[j+1], b=px[j+2];
+    lum += r*0.299 + g*0.587 + b*0.114;
+    if(r > thr && r > g*1.5 && r > b*1.5) mask[i] = 1;
+  }
+  S.lum = lum / n;
+
+  // Zusammenhaengende rote Flaechen finden
+  var seen = new Uint8Array(n), stack = [], blobs = [];
+  for(var s0=0; s0<n; s0++){
+    if(!mask[s0] || seen[s0]) continue;
+    stack.length = 0; stack.push(s0); seen[s0] = 1;
+    var minx=W, maxx=0, miny=H, maxy=0, cnt=0;
+    while(stack.length){
+      var k = stack.pop(), kx = k % W, ky = (k / W) | 0;
+      cnt++;
+      if(kx<minx) minx=kx; if(kx>maxx) maxx=kx;
+      if(ky<miny) miny=ky; if(ky>maxy) maxy=ky;
+      if(kx>0   && mask[k-1] && !seen[k-1]){ seen[k-1]=1; stack.push(k-1); }
+      if(kx<W-1 && mask[k+1] && !seen[k+1]){ seen[k+1]=1; stack.push(k+1); }
+      if(ky>0   && mask[k-W] && !seen[k-W]){ seen[k-W]=1; stack.push(k-W); }
+      if(ky<H-1 && mask[k+W] && !seen[k+W]){ seen[k+W]=1; stack.push(k+W); }
+    }
+    if(cnt >= 3 && cnt < n*0.12){
+      blobs.push({ cx:(minx+maxx)/2, cy:(miny+maxy)/2,
+                   w:maxx-minx+1, h:maxy-miny+1, n:cnt, x:minx, y:miny });
+    }
+  }
+
+  // Paare bilden: gleiche Hoehe, aehnliche Groesse, plausibler Abstand
+  var pairs = [], mid = W/2;
+  for(var a=0; a<blobs.length; a++){
+    for(var bI=a+1; bI<blobs.length; bI++){
+      var L = blobs[a], R = blobs[bI];
+      if(L.cx > R.cx){ var tmp = L; L = R; R = tmp; }
+      var dx = R.cx - L.cx;
+      if(dx < 4) continue;
+      if(Math.abs(L.cy - R.cy) > dx * 0.22) continue;           // etwa auf einer Hoehe
+      var br = Math.max(L.n, R.n) / Math.min(L.n, R.n);
+      if(br > 3.2) continue;                                     // aehnlich gross
+      var lw = (L.w + R.w) / 2;
+      if(dx < lw * 1.8 || dx > lw * 16) continue;                // plausibles Verhaeltnis
+      if(dx > W * 0.85) continue;
+      pairs.push({ L:L, R:R, dx:dx, cx:(L.cx + R.cx)/2,
+                   score: dx - Math.abs((L.cx+R.cx)/2 - mid) * 1.4 });
+    }
+  }
+  if(!pairs.length) return { all:[], lead:null };
+
+  var best = pairs.reduce(function(a,b){ return b.score > a.score ? b : a; });
+  var sc = vw / W;                                               // zurueck auf Videopixel
+  var top = Math.min(best.L.y, best.R.y), bot = Math.max(best.L.y + best.L.h, best.R.y + best.R.h);
+  var lead = {
+    x: best.L.cx * sc, y: top * sc,
+    w: best.dx * sc, h: Math.max(bot - top, 4) * sc,
+    cls: "lights"
+  };
+  var all = [];
+  pairs.forEach(function(p){
+    if(p === best) return;
+    all.push({ x:p.L.cx*sc, y:Math.min(p.L.y,p.R.y)*sc, w:p.dx*sc, h:Math.max(p.L.h,p.R.h)*sc, cls:"lights" });
+  });
+  return { all:all, lead:lead };
+}
+
 async function detectLoop(){
   while(S.running){
-    if(!S.model){ await new Promise(function(r){ setTimeout(r, 200); }); continue; }
     if(video.readyState >= 2){
-      var t0 = performance.now();
-      var preds;
-      try{ preds = await S.model.detect(video, 12); }catch(e){ preds = []; }
       var vw = video.videoWidth || 1, mid = vw/2, band = vw*0.24;
-      var list = [];
-      for(var i=0;i<preds.length;i++){
-        var p = preds[i];
-        if(!VEHICLES[p.class] || p.score < S.conf) continue;
-        list.push({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3], cls:p.class, score:p.score });
+      var list = [], lead = null, nres = null;
+
+      // Helligkeit messen und ggf. Nachtmodus fahren
+      if(S.mode !== "day") nres = nightDetect();
+      var useNight = (S.mode === "night") ||
+                     (S.mode === "auto" && nres && S.lum < 62);
+      var modeNow = useNight ? "night" : "day";
+      if(modeNow !== S.activeMode){ S.activeMode = modeNow; kf.reset(); }
+
+      if(useNight){
+        list = nres ? nres.all : [];
+        lead = nres ? nres.lead : null;
+        S.dets = list;
+      } else if(S.model){
+        var preds;
+        try{ preds = await S.model.detect(video, 12); }catch(e){ preds = []; }
+        for(var i=0;i<preds.length;i++){
+          var p = preds[i];
+          if(!VEHICLES[p.class] || p.score < S.conf) continue;
+          list.push({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3], cls:p.class, score:p.score });
+        }
+        S.dets = list;
+        var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
+        lead = cand.length ? cand.reduce(function(a,b){ return b.w > a.w ? b : a; }) : null;
+      } else {
+        S.dets = [];
+        await new Promise(function(r){ setTimeout(r, 150); });
+        continue;                                    // Handbetrieb
       }
-      S.dets = list;
-      var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
-      var lead = cand.length ? cand.reduce(function(a,b){ return b.w > a.w ? b : a; }) : null;
 
       var now = performance.now();
       var dt = S.lastDetT ? (now - S.lastDetT)/1000 : 0;
@@ -324,7 +437,8 @@ async function detectLoop(){
 
       if(lead){
         var f = focalPx(vw, S.fov);
-        var realW = S.calibrating ? S.calWidth : (REALW[lead.cls] || S.realW);
+        var realW = S.calibrating ? S.calWidth
+                  : (lead.cls === "lights" ? S.lightSpan : (REALW[lead.cls] || S.realW));
         var dRaw = distFromBox(lead.w, realW, f);
         if(S.calibrating){
           finishCalib(lead.w, vw);
@@ -376,6 +490,17 @@ function draw(){
 
   if(S.lead){
     var b = S.lead;
+    if(b.cls === "lights"){
+      // Nachtmodus: die beiden Leuchten markieren und den Mittenabstand zeigen
+      var yl = Y(b.y) + b.h*s/2;
+      cx.strokeStyle = col; cx.lineWidth = 2;
+      [X(b.x), X(b.x)+b.w*s].forEach(function(xp){
+        cx.beginPath(); cx.arc(xp, yl, Math.max(7, b.h*s*0.5), 0, Math.PI*2); cx.stroke();
+      });
+      cx.setLineDash([6,5]);
+      cx.beginPath(); cx.moveTo(X(b.x), yl); cx.lineTo(X(b.x)+b.w*s, yl); cx.stroke();
+      cx.setLineDash([]);
+    }
     cx.strokeStyle = col; cx.lineWidth = 3;
     cx.strokeRect(X(b.x), Y(b.y), b.w*s, b.h*s);
     var cl = Math.max(10, b.w*s*0.18);
@@ -403,6 +528,9 @@ function draw(){
   set("d-vlead", isFinite(dv) ? Math.round(vo*3.6+dv) : "—");
   set("d-dv", isFinite(dv) ? (dv>=0?"+":"") + fmt(dv,1) : "—", dv < -2 ? "warn" : "");
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
+  set("d-mode", S.model || S.activeMode === "night"
+      ? (S.activeMode === "night" ? "Nacht" : "Tag")
+      : "Hand");
   var ve = document.getElementById("verdict");
   if(!S.model && !S.lead){
     ve.textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
@@ -501,6 +629,12 @@ document.getElementById("i-fov").addEventListener("input", function(){
   document.getElementById("l-fov").textContent = (+this.value).toFixed(1) + "°";
 });
 document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
+document.getElementById("i-mode").addEventListener("change", function(){ S.mode = this.value; kf.reset(); });
+document.getElementById("i-span").addEventListener("input", function(){ S.lightSpan = +this.value; kf.reset(); });
+document.getElementById("i-red").addEventListener("input", function(){
+  S.redMin = +this.value;
+  document.getElementById("l-red").textContent = this.value;
+});
 document.getElementById("i-conf").addEventListener("input", function(){
   S.conf = +this.value;
   document.getElementById("l-conf").textContent = (+this.value).toFixed(2);
