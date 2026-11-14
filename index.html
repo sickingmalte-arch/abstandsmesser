@@ -98,6 +98,7 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <div class="cell"><div class="k">v eigen</div><div class="v" id="d-vown">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">v vorn</div><div class="v" id="d-vlead">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">Δv</div><div class="v" id="d-dv">—<span class="u">km/h</span></div></div>
+      <div class="cell"><div class="k">Kontakt in</div><div class="v" id="d-ttc">—<span class="u">s</span></div></div>
       <div class="cell"><div class="k">Genauigkeit</div><div class="v" id="d-err">—</div></div>
       <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
       <div class="cell"><div class="k">Modus</div><div class="v" id="d-mode" style="font-size:.95rem">—</div></div>
@@ -885,6 +886,17 @@ function nightDetect(fr){
 /* --- Zielverfolgung ueber Bilder hinweg ---
    Ohne sie springt die Auswahl zwischen Fahrzeugen hin und her, und der
    Kalman-Filter haelt den Sprung fuer eine rasante Annaeherung. */
+/* Mitte der eigenen Spur auf Hoehe eines Bildpunktes. In der Kurve steht der
+   Vordermann nicht in der Bildmitte - sucht man ihn dort, verliert man ihn
+   genau dann, wenn es interessant wird. */
+function laneMid(yVideo, vw){
+  var lane = S.lane;
+  if(!lane) return vw/2;
+  var ys = yVideo / lane.sc;
+  var m = (((lane.L.a*ys + lane.L.b) + (lane.R.a*ys + lane.R.b))/2) * lane.sc;
+  return (m > vw*0.10 && m < vw*0.90) ? m : vw/2;
+}
+
 function pickTarget(cands, vw){
   if(!cands.length){
     if(S.track){
@@ -893,7 +905,7 @@ function pickTarget(cands, vw){
     }
     return null;
   }
-  var mid = vw/2, best = null, bestScore = -1e9;
+  var best = null, bestScore = -1e9;
   if(S.track){
     var t = S.track;
     cands.forEach(function(c){
@@ -906,8 +918,8 @@ function pickTarget(cands, vw){
   }
   if(!best){
     best = cands.reduce(function(a,b){
-      var sa = a.w - Math.abs(a.x + a.w/2 - mid)/vw * a.w * 2;
-      var sb = b.w - Math.abs(b.x + b.w/2 - mid)/vw * b.w * 2;
+      var sa = a.w - Math.abs(a.x + a.w/2 - laneMid(a.y + a.h, vw))/vw * a.w * 2;
+      var sb = b.w - Math.abs(b.x + b.w/2 - laneMid(b.y + b.h, vw))/vw * b.w * 2;
       return sb > sa ? b : a;
     });
     if(S.track) kf.reset();                    // echter Zielwechsel
@@ -947,7 +959,7 @@ async function detectLoop(){
     var tLoop = performance.now();
     if(video.readyState >= 2){
       var vw = video.videoWidth || 1, vh = video.videoHeight || 1;
-      var mid = vw/2, band = vw*0.30;
+      var band = vw*0.30;
       var tNow = performance.now();
       var list = [], lead = null, nres = null;
 
@@ -1010,7 +1022,9 @@ async function detectLoop(){
         }
         S.dets = list;
         S.win = win;
-        var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
+        var cand = list.filter(function(b){
+          return Math.abs(b.x + b.w/2 - laneMid(b.y + b.h, vw)) < band;
+        });
         lead = pickTarget(cand, vw);
         if(lead) S.lastDayHit = tNow;
       } else {
@@ -1208,9 +1222,19 @@ function draw(){
   if(solide && isFinite(gap) && gap < S.warnGap){
     beep(gap < S.warnGap*0.65 || (S.lead.vRel < -2 && gap < S.warnGap*1.15));
   }
+  var ttcWarn = false;
   set("d-vown", Math.round(vo*3.6) + (S.speedMode==="gps" && S.vOwn!==null ? "" : "*"));
   set("d-vlead", isFinite(dv) ? Math.round(vo*3.6+dv) : "—");
   set("d-dv", isFinite(dv) ? (dv>=0?"+":"") + fmt(dv,1) : "—", dv < -2 ? "warn" : "");
+  /* Zeit bis zum Kontakt. Die Zeitluecke sagt, wie weit man haengt; sie sagt
+     nichts darueber, wie schnell man aufschliesst. Mit grossem Abstand auf
+     einen langsamen Lastwagen aufzulaufen ist unauffaellig, bis es zu spaet
+     ist - deshalb steht das hier getrennt. */
+  var ttc = NaN;
+  if(S.lead && S.lead.dist && S.lead.vRel < -0.3) ttc = S.lead.dist / -S.lead.vRel;
+  set("d-ttc", isFinite(ttc) && ttc < 99 ? fmt(ttc, ttc < 10 ? 1 : 0) : "—",
+      isFinite(ttc) ? (ttc < 4 ? "crit" : (ttc < 8 ? "warn" : "")) : "");
+  if(solide && isFinite(ttc) && ttc < 6){ ttcWarn = true; beep(ttc < 3.5); }
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
   var modeTxt = S.model || S.activeMode === "night"
       ? (S.activeMode === "night" ? (S.dusk ? "Dämmerung" : "Nacht") : "Tag") : "Hand";
@@ -1240,8 +1264,8 @@ function draw(){
     ve.textContent = "misst …";
     ve.className = "";
   } else {
-    ve.textContent = j.t + (recWord ? " · " + recWord : "");
-    ve.className = j.c;
+    ve.textContent = (ttcWarn ? "LÄUFT AUF · " : "") + j.t + (recWord ? " · " + recWord : "");
+    ve.className = ttcWarn && j.c !== "crit" ? "warn" : j.c;
   }
 }
 
