@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Abstandsmesser live</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --bg:#07090A; --panel:#13171A; --panel2:#1C2126; --line:#2A3135;
+  --fg:#E8EDEF; --muted:#8A989E; --accent:#4CC9F0;
+  --good:#35D07F; --warn:#F5C542; --crit:#FF4D4D;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,Segoe UI,sans-serif;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:var(--sans);overflow:hidden;
+  -webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent}
+
+#stage{position:fixed;inset:0;background:#000}
+#cam{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+#overlay{position:absolute;inset:0;width:100%;height:100%;touch-action:none}
+
+/* Kopfzeile */
+#hud{position:absolute;top:0;left:0;right:0;z-index:5;
+  padding:calc(env(safe-area-inset-top,0px) + 10px) max(12px,env(safe-area-inset-right,0px)) 10px max(12px,env(safe-area-inset-left,0px));
+  background:linear-gradient(180deg,rgba(0,0,0,.78),rgba(0,0,0,0));pointer-events:none}
+.row{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.cell{min-width:0}
+.cell .k{font-size:.6rem;letter-spacing:.1em;text-transform:uppercase;color:#9FB0B6;
+  text-shadow:0 1px 3px #000}
+.cell .v{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600;
+  line-height:1.05;text-shadow:0 2px 6px #000}
+.cell.xl .v{font-size:2.5rem} .cell .v{font-size:1.2rem}
+.cell .u{font-size:.6em;color:#9FB0B6;margin-left:2px;font-family:var(--sans);font-weight:400}
+.good{color:var(--good)} .warn{color:var(--warn)} .crit{color:var(--crit)}
+#verdict{font-size:.82rem;font-weight:600;margin-top:4px;text-shadow:0 1px 4px #000}
+
+/* Fusszeile */
+#bar{position:absolute;left:0;right:0;bottom:0;z-index:5;display:flex;gap:8px;
+  padding:10px max(12px,env(safe-area-inset-right,0px)) calc(env(safe-area-inset-bottom,0px) + 10px) max(12px,env(safe-area-inset-left,0px));
+  background:linear-gradient(0deg,rgba(0,0,0,.8),rgba(0,0,0,0))}
+button{font-family:var(--sans);font-size:.85rem;font-weight:500;cursor:pointer;
+  background:rgba(28,33,38,.9);color:var(--fg);border:1px solid var(--line);
+  border-radius:9px;padding:11px 14px;backdrop-filter:blur(6px)}
+button:active{background:var(--panel2)}
+button.pri{background:var(--accent);color:#04161C;border-color:var(--accent);font-weight:700}
+button:disabled{opacity:.45}
+#bar button{flex:1 1 auto}
+
+/* Startschirm und Einstellungen */
+.sheet{position:absolute;inset:0;z-index:10;background:rgba(7,9,10,.96);overflow-y:auto;
+  padding:calc(env(safe-area-inset-top,0px) + 22px) max(18px,env(safe-area-inset-left,0px))
+          calc(env(safe-area-inset-bottom,0px) + 22px) max(18px,env(safe-area-inset-right,0px))}
+.sheet-in{max-width:520px;margin:0 auto}
+h1{font-size:1.45rem;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:1rem;margin:22px 0 8px}
+p{margin:0 0 12px;font-size:.9rem;color:var(--muted);line-height:1.55}
+p strong{color:var(--fg)}
+.warnbox{background:#2A1A18;border:1px solid #5A2B26;border-left:3px solid var(--crit);
+  border-radius:9px;padding:12px 14px;margin:14px 0}
+.warnbox p{margin:0;color:#E4C4C0;font-size:.85rem}
+.warnbox strong{color:#FFB3AD}
+label{display:block;font-size:.78rem;color:var(--muted);margin:14px 0 6px}
+label b{color:var(--fg);font-family:var(--mono);font-weight:500}
+input[type=number],select{width:100%;background:var(--panel2);color:var(--fg);
+  border:1px solid var(--line);border-radius:8px;padding:10px;font-family:var(--mono);font-size:1rem}
+input[type=range]{width:100%;accent-color:var(--accent)}
+.btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:18px}
+.btns button{flex:1 1 140px}
+#status{font-size:.82rem;color:var(--muted);margin-top:14px;padding:11px 13px;
+  background:var(--panel2);border:1px solid var(--line);border-radius:8px}
+#status.err{background:#2A1A18;border-color:#5A2B26;color:#E4C4C0}
+#status.ok{border-color:#2A5540;color:var(--good)}
+table{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:8px}
+td{padding:6px 8px 6px 0;border-top:1px solid var(--line);font-family:var(--mono)}
+td:first-child{font-family:var(--sans);color:var(--muted)}
+.hint{font-size:.78rem;color:var(--muted);margin-top:8px}
+kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line);
+  border-radius:4px;padding:1px 5px;font-size:.9em}
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="cam" playsinline muted autoplay></video>
+  <canvas id="overlay"></canvas>
+
+  <div id="hud">
+    <div class="row">
+      <div class="cell xl"><div class="k">Abstand</div><div class="v" id="d-dist">—<span class="u">m</span></div></div>
+      <div class="cell xl"><div class="k">Zeitlücke</div><div class="v" id="d-gap">—<span class="u">s</span></div></div>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <div class="cell"><div class="k">v eigen</div><div class="v" id="d-vown">—<span class="u">km/h</span></div></div>
+      <div class="cell"><div class="k">v vorn</div><div class="v" id="d-vlead">—<span class="u">km/h</span></div></div>
+      <div class="cell"><div class="k">Δv</div><div class="v" id="d-dv">—<span class="u">km/h</span></div></div>
+      <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
+    </div>
+    <div id="verdict"></div>
+  </div>
+
+  <div id="bar">
+    <button id="b-set">Einstellungen</button>
+    <button id="b-cal">Kalibrieren</button>
+    <button id="b-rec">Aufzeichnen</button>
+  </div>
+</div>
+
+<!-- Startschirm -->
+<div class="sheet" id="start">
+  <div class="sheet-in">
+    <h1>Abstandsmesser live</h1>
+    <p>Misst Abstand und Relativgeschwindigkeit zum vorausfahrenden Fahrzeug aus dem Kamerabild.</p>
+
+    <div class="warnbox">
+      <p><strong>Messgerät, kein Assistenzsystem.</strong> Greift nicht ins Fahrzeug ein und ist nicht dafür gebaut, sich im Verkehr darauf zu verlassen. Handy fest montieren, quer. Starten und bedienen nur im Stand oder durch den Beifahrer.</p>
+    </div>
+
+    <h2>Vor dem Start</h2>
+    <p>Handy <strong>quer</strong> in eine feste Halterung, Kamera frei auf die Fahrbahn gerichtet. Die Erkennung braucht einmalig etwa 5 MB Modelldaten aus dem Netz.</p>
+
+    <div class="btns">
+      <button class="pri" id="b-start">Kamera starten</button>
+    </div>
+    <div id="status">Bereit.</div>
+
+    <h2>Deine Kalibrierung</h2>
+    <p>Voreingestellt für das Pixel 8, ermittelt aus einem Foto bei 10 m Abstand: 1851 px Brennweite, entspricht 26 mm Kleinbild.</p>
+    <table>
+      <tr><td>Blickwinkel quer</td><td>69,7°</td></tr>
+      <tr><td>Fahrzeugbreite</td><td>1,80 m</td></tr>
+    </table>
+    <p class="hint">Der Videostrom hat oft einen anderen Bildausschnitt als die Fotokamera. Mach die Kalibrierung deshalb einmal <strong>hier in der App</strong>: Stell dich in bekanntem Abstand hinter ein Auto und tippe auf „Kalibrieren“.</p>
+  </div>
+</div>
+
+<!-- Einstellungen -->
+<div class="sheet" id="settings" hidden>
+  <div class="sheet-in">
+    <h1>Einstellungen</h1>
+
+    <label for="i-fov">Blickwinkel der Kamera <b id="l-fov">69.7°</b></label>
+    <input type="range" id="i-fov" min="30" max="110" step="0.1" value="69.7">
+
+    <label for="i-width">Angenommene Fahrzeugbreite in m</label>
+    <input type="number" id="i-width" value="1.80" min="0.5" max="3" step="0.01">
+
+    <label for="i-speed">Eigene Geschwindigkeit</label>
+    <select id="i-speed">
+      <option value="gps">per GPS messen</option>
+      <option value="man">fest eintragen</option>
+    </select>
+    <input type="number" id="i-manspeed" value="100" min="1" max="250" step="1" style="margin-top:8px">
+
+    <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.45</b></label>
+    <input type="range" id="i-conf" min="0.2" max="0.8" step="0.05" value="0.45">
+
+    <div class="btns">
+      <button class="pri" id="b-close">Zurück</button>
+      <button id="b-csv">Aufzeichnung speichern</button>
+    </div>
+    <p class="hint" id="recinfo">Noch nichts aufgezeichnet.</p>
+  </div>
+</div>
+
+<!-- Kalibrierung -->
+<div class="sheet" id="calib" hidden>
+  <div class="sheet-in">
+    <h1>Kalibrieren</h1>
+    <p>Stell dich in <strong>bekanntem Abstand</strong> hinter ein Fahrzeug — Maßband oder abgeschritten. Trag den Abstand und die echte Breite dieses Fahrzeugs ein, dann zurück und das erkannte Fahrzeug antippen.</p>
+    <label for="i-caldist">Bekannter Abstand in m</label>
+    <input type="number" id="i-caldist" value="10" min="1" max="100" step="0.1">
+    <label for="i-calwidth">Echte Breite dieses Fahrzeugs in m</label>
+    <input type="number" id="i-calwidth" value="1.772" min="0.5" max="3" step="0.001">
+    <p class="hint">Audi A4 B7: 1,772 m · VW Golf VII: 1,799 m · Transporter: etwa 2,00 m · Lkw: 2,55 m</p>
+    <div class="btns">
+      <button class="pri" id="b-calgo">Jetzt messen</button>
+      <button id="b-calclose">Abbrechen</button>
+    </div>
+    <div id="calstatus" style="margin-top:14px;font-size:.88rem;color:var(--muted)"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+"use strict";
+
+/* ---------------- Mathematik ---------------- */
+var focalPx = function(w, fovDeg){ return (w/2) / Math.tan(fovDeg*Math.PI/360); };
+var distFromBox = function(px, realW, f){ return f*realW/px; };
+var fmt = function(n,d){ return isFinite(n) ? n.toFixed(d===undefined?1:d).replace(".",",") : "—"; };
+
+function Kalman(q,r){ this.q=q||0.6; this.r=r||4; this.ready=false; }
+Kalman.prototype.reset = function(){ this.ready=false; };
+Kalman.prototype.update = function(z,dt){
+  if(!this.ready || !(dt>0) || dt>1.5){ this.d=z; this.v=0; this.P=[[25,0],[0,25]]; this.ready=true; return; }
+  var dp=this.d+this.v*dt, vp=this.v, P=this.P, q=this.q;
+  var a00=P[0][0]+dt*(P[1][0]+P[0][1])+dt*dt*P[1][1]+q*dt*dt*dt/3;
+  var a01=P[0][1]+dt*P[1][1]+q*dt*dt/2;
+  var a10=P[1][0]+dt*P[1][1]+q*dt*dt/2;
+  var a11=P[1][1]+q*dt;
+  var S=a00+this.r, K0=a00/S, K1=a10/S, y=z-dp;
+  this.d=dp+K0*y; this.v=vp+K1*y;
+  this.P=[[(1-K0)*a00,(1-K0)*a01],[a10-K1*a00,a11-K1*a01]];
+};
+
+/* "Halber Tacho" ist bei jedem Tempo genau 1,8 s. */
+function judge(g){
+  if(!isFinite(g)) return {c:"",t:""};
+  if(g<1.8) return {c:"crit", t:"UNTER HALBEM TACHO"};
+  if(g<2.0) return {c:"warn", t:"knapp"};
+  if(g<3.0) return {c:"good", t:"sicher"};
+  return {c:"good", t:"sicher und sparsam"};
+}
+
+/* ---------------- Zustand ---------------- */
+var S = {
+  fov:69.7, realW:1.80, conf:0.45,
+  speedMode:"gps", manSpeed:100,
+  vOwn:null, model:null, running:false,
+  dets:[], lead:null, lastDetT:0, fps:0,
+  calibrating:false, calDist:10, calWidth:1.772,
+  rec:false, log:[]
+};
+var kf = new Kalman();
+var video = document.getElementById("cam");
+var cv = document.getElementById("overlay");
+var cx = cv.getContext("2d");
+
+function status(msg, cls){
+  var el = document.getElementById("status");
+  el.textContent = msg; el.className = cls || "";
+}
+
+/* ---------------- Kamera ---------------- */
+async function start(){
+  if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+    status("Dieser Browser gibt keinen Kamerazugriff frei. Die Seite muss über https:// laufen — bei einer lokal geöffneten Datei sperrt der Browser die Kamera.", "err");
+    return;
+  }
+  if(!window.isSecureContext){
+    status("Die Seite läuft nicht über eine gesicherte Verbindung. Die Kamera geht nur über https:// oder localhost.", "err");
+    return;
+  }
+  status("Frage Kamera an …");
+  try{
+    var stream = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080} },
+      audio:false
+    });
+    video.srcObject = stream;
+    await video.play();
+  }catch(e){
+    status("Kamera abgelehnt oder nicht verfügbar (" + e.name + "). Erlaube den Zugriff in den Seiteneinstellungen des Browsers.", "err");
+    return;
+  }
+
+  status("Lade Erkennungsmodell … (einmalig etwa 5 MB)");
+  try{
+    if(typeof cocoSsd === "undefined") throw new Error("Bibliothek nicht geladen");
+    S.model = await cocoSsd.load({ base:"lite_mobilenet_v2" });
+  }catch(e){
+    // Ohne Modell geht es trotzdem weiter: dann wird von Hand gemessen.
+    S.model = null;
+    status("Automatische Erkennung nicht verfügbar (" + e.message + "). Weiter im Handbetrieb: Rechteck über die Fahrzeugbreite ziehen.", "err");
+  }
+
+  startGps();
+  try{ if(navigator.wakeLock) await navigator.wakeLock.request("screen"); }catch(e){}
+
+  document.getElementById("start").hidden = true;
+  if(!S.model){
+    document.getElementById("verdict").textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
+  }
+  S.running = true;
+  detectLoop();
+  requestAnimationFrame(draw);
+}
+
+function startGps(){
+  if(!navigator.geolocation) return;
+  navigator.geolocation.watchPosition(function(pos){
+    if(pos.coords && typeof pos.coords.speed === "number" && pos.coords.speed >= 0){
+      S.vOwn = pos.coords.speed;           // m/s
+    }
+  }, function(){}, { enableHighAccuracy:true, maximumAge:1000, timeout:10000 });
+}
+
+function ownSpeed(){
+  if(S.speedMode === "man" || S.vOwn === null) return Math.max(1, S.manSpeed)/3.6;
+  return Math.max(S.vOwn, 0.5);
+}
+
+/* ---------------- Erkennung ---------------- */
+var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
+var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
+
+async function detectLoop(){
+  while(S.running){
+    if(!S.model){ await new Promise(function(r){ setTimeout(r, 200); }); continue; }
+    if(video.readyState >= 2){
+      var t0 = performance.now();
+      var preds;
+      try{ preds = await S.model.detect(video, 12); }catch(e){ preds = []; }
+      var vw = video.videoWidth || 1, mid = vw/2, band = vw*0.24;
+      var list = [];
+      for(var i=0;i<preds.length;i++){
+        var p = preds[i];
+        if(!VEHICLES[p.class] || p.score < S.conf) continue;
+        list.push({ x:p.bbox[0], y:p.bbox[1], w:p.bbox[2], h:p.bbox[3], cls:p.class, score:p.score });
+      }
+      S.dets = list;
+      var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
+      var lead = cand.length ? cand.reduce(function(a,b){ return b.w > a.w ? b : a; }) : null;
+
+      var now = performance.now();
+      var dt = S.lastDetT ? (now - S.lastDetT)/1000 : 0;
+      S.lastDetT = now;
+      S.fps = dt > 0 ? (0.8*S.fps + 0.2*(1/dt)) : S.fps;
+
+      if(lead){
+        var f = focalPx(vw, S.fov);
+        var realW = S.calibrating ? S.calWidth : (REALW[lead.cls] || S.realW);
+        var dRaw = distFromBox(lead.w, realW, f);
+        if(S.calibrating){
+          finishCalib(lead.w, vw);
+        } else {
+          kf.update(dRaw, dt);
+          lead.dist = kf.d; lead.vRel = kf.v; lead.raw = dRaw;
+          if(S.rec){
+            var vo = ownSpeed();
+            S.log.push([ (now/1000).toFixed(2), lead.w.toFixed(1), dRaw.toFixed(2), kf.d.toFixed(2),
+                         (kf.v*3.6).toFixed(1), (vo*3.6).toFixed(1), ((vo+kf.v)*3.6).toFixed(1),
+                         (kf.d/vo).toFixed(2) ]);
+          }
+        }
+      } else {
+        kf.reset();
+      }
+      S.lead = lead;
+    }
+    await new Promise(function(r){ setTimeout(r, 1); });
+  }
+}
+
+/* ---------------- Zeichnen ---------------- */
+function draw(){
+  if(!S.running) return;
+  requestAnimationFrame(draw);
+  var r = cv.getBoundingClientRect();
+  if(cv.width !== Math.round(r.width) || cv.height !== Math.round(r.height)){
+    cv.width = Math.round(r.width); cv.height = Math.round(r.height);
+  }
+  cx.clearRect(0,0,cv.width,cv.height);
+
+  var vw = video.videoWidth, vh = video.videoHeight;
+  if(!vw) return;
+  // object-fit: cover -> gemeinsamer Massstab, zentriert
+  var s = Math.max(cv.width/vw, cv.height/vh);
+  var ox = (cv.width - vw*s)/2, oy = (cv.height - vh*s)/2;
+  var X = function(x){ return ox + x*s; }, Y = function(y){ return oy + y*s; };
+
+  var gap = (S.lead && S.lead.dist) ? S.lead.dist/ownSpeed() : NaN;
+  var j = judge(gap);
+  var col = j.c === "crit" ? "#FF4D4D" : (j.c === "warn" ? "#F5C542" : "#35D07F");
+
+  cx.lineWidth = 1.5; cx.strokeStyle = "rgba(150,160,165,.5)";
+  S.dets.forEach(function(b){
+    if(b === S.lead) return;
+    cx.strokeRect(X(b.x), Y(b.y), b.w*s, b.h*s);
+  });
+
+  if(S.lead){
+    var b = S.lead;
+    cx.strokeStyle = col; cx.lineWidth = 3;
+    cx.strokeRect(X(b.x), Y(b.y), b.w*s, b.h*s);
+    var cl = Math.max(10, b.w*s*0.18);
+    cx.lineWidth = 5;
+    [[X(b.x),Y(b.y),1,1],[X(b.x)+b.w*s,Y(b.y),-1,1],
+     [X(b.x),Y(b.y)+b.h*s,1,-1],[X(b.x)+b.w*s,Y(b.y)+b.h*s,-1,-1]].forEach(function(c){
+      cx.beginPath(); cx.moveTo(c[0]+c[2]*cl,c[1]); cx.lineTo(c[0],c[1]); cx.lineTo(c[0],c[1]+c[3]*cl); cx.stroke();
+    });
+    if(b.dist){
+      cx.font = "600 17px 'IBM Plex Mono', monospace";
+      cx.fillStyle = col; cx.textAlign = "center";
+      cx.fillText(fmt(b.dist,1) + " m", X(b.x)+b.w*s/2, Math.max(20, Y(b.y)-10));
+      cx.font = "400 12px 'IBM Plex Mono', monospace";
+      cx.fillStyle = "rgba(200,210,215,.85)";
+      cx.fillText(Math.round(b.w) + " px", X(b.x)+b.w*s/2, Y(b.y)+b.h*s+18);
+      cx.textAlign = "left";
+    }
+  }
+
+  // Anzeigen
+  var vo = ownSpeed(), dv = S.lead && S.lead.vRel !== undefined ? S.lead.vRel*3.6 : NaN;
+  set("d-dist", S.lead && S.lead.dist ? fmt(S.lead.dist,1) : "—", j.c);
+  set("d-gap", isFinite(gap) ? fmt(gap,2) : "—", j.c);
+  set("d-vown", Math.round(vo*3.6) + (S.speedMode==="gps" && S.vOwn!==null ? "" : "*"));
+  set("d-vlead", isFinite(dv) ? Math.round(vo*3.6+dv) : "—");
+  set("d-dv", isFinite(dv) ? (dv>=0?"+":"") + fmt(dv,1) : "—", dv < -2 ? "warn" : "");
+  set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
+  var ve = document.getElementById("verdict");
+  if(!S.model && !S.lead){
+    ve.textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
+    ve.className = "";
+  } else {
+    ve.textContent = j.t; ve.className = j.c;
+  }
+}
+
+function set(id, val, cls){
+  var el = document.getElementById(id);
+  el.firstChild.nodeValue = val;
+  el.className = "v" + (cls ? " " + cls : "");
+}
+
+/* ---------------- Kalibrierung ---------------- */
+function finishCalib(boxPx, vw){
+  S.calibrating = false;
+  var f = boxPx * S.calDist / S.calWidth;
+  var fov = 2*Math.atan(vw/(2*f))*180/Math.PI;
+  S.fov = fov;
+  document.getElementById("i-fov").value = fov.toFixed(1);
+  document.getElementById("l-fov").textContent = fov.toFixed(1) + "°";
+  document.getElementById("calstatus").innerHTML =
+    "Box " + Math.round(boxPx) + " px bei " + S.calDist + " m<br>" +
+    "Brennweite " + Math.round(f) + " px<br><strong>Blickwinkel " + fov.toFixed(1) + "° übernommen</strong>";
+  document.getElementById("calib").hidden = false;
+  kf.reset();
+}
+
+/* ---------------- Handbetrieb: Rechteck ziehen ---------------- */
+function toVideo(clientX, clientY){
+  var r = cv.getBoundingClientRect();
+  var vw = video.videoWidth || 1, vh = video.videoHeight || 1;
+  var s = Math.max(r.width/vw, r.height/vh);
+  var ox = (r.width - vw*s)/2, oy = (r.height - vh*s)/2;
+  return { x:(clientX - r.left - ox)/s, y:(clientY - r.top - oy)/s };
+}
+var mDrag = null;
+function mStart(e){
+  if(S.model) return;                       // bei aktiver Erkennung nicht noetig
+  e.preventDefault();
+  var t = e.touches ? e.touches[0] : e;
+  mDrag = toVideo(t.clientX, t.clientY);
+  S.manual = null;
+}
+function mMove(e){
+  if(!mDrag) return;
+  e.preventDefault();
+  var t = e.touches ? e.touches[0] : e;
+  var p = toVideo(t.clientX, t.clientY);
+  S.manual = { x:Math.min(mDrag.x,p.x), y:Math.min(mDrag.y,p.y),
+               w:Math.abs(p.x-mDrag.x), h:Math.abs(p.y-mDrag.y), cls:"manuell" };
+}
+function mEnd(){
+  mDrag = null;
+  if(S.manual && S.manual.w > 4){
+    var f = focalPx(video.videoWidth || 1, S.fov);
+    if(S.calibrating){ finishCalib(S.manual.w, video.videoWidth || 1); S.manual = null; return; }
+    S.manual.dist = distFromBox(S.manual.w, S.realW, f);
+    S.lead = S.manual;
+  }
+}
+cv.addEventListener("mousedown", mStart);
+window.addEventListener("mousemove", mMove);
+window.addEventListener("mouseup", mEnd);
+cv.addEventListener("touchstart", mStart, {passive:false});
+cv.addEventListener("touchmove", mMove, {passive:false});
+cv.addEventListener("touchend", mEnd);
+
+/* ---------------- Bedienung ---------------- */
+document.getElementById("b-start").addEventListener("click", start);
+document.getElementById("b-set").addEventListener("click", function(){
+  document.getElementById("settings").hidden = false;
+});
+document.getElementById("b-close").addEventListener("click", function(){
+  document.getElementById("settings").hidden = true;
+});
+document.getElementById("b-cal").addEventListener("click", function(){
+  document.getElementById("calstatus").textContent = "";
+  document.getElementById("calib").hidden = false;
+});
+document.getElementById("b-calclose").addEventListener("click", function(){
+  S.calibrating = false;
+  document.getElementById("calib").hidden = true;
+});
+document.getElementById("b-calgo").addEventListener("click", function(){
+  S.calDist = +document.getElementById("i-caldist").value;
+  S.calWidth = +document.getElementById("i-calwidth").value;
+  S.calibrating = true;
+  document.getElementById("calib").hidden = true;
+});
+
+document.getElementById("i-fov").addEventListener("input", function(){
+  S.fov = +this.value;
+  document.getElementById("l-fov").textContent = (+this.value).toFixed(1) + "°";
+});
+document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
+document.getElementById("i-conf").addEventListener("input", function(){
+  S.conf = +this.value;
+  document.getElementById("l-conf").textContent = (+this.value).toFixed(2);
+});
+document.getElementById("i-speed").addEventListener("change", function(){ S.speedMode = this.value; });
+document.getElementById("i-manspeed").addEventListener("input", function(){ S.manSpeed = +this.value; });
+
+document.getElementById("b-rec").addEventListener("click", function(){
+  S.rec = !S.rec;
+  this.textContent = S.rec ? "Aufzeichnung läuft" : "Aufzeichnen";
+  this.className = S.rec ? "pri" : "";
+  if(S.rec) S.log = [];
+  document.getElementById("recinfo").textContent =
+    S.rec ? "Aufzeichnung läuft …" : (S.log.length + " Messpunkte aufgezeichnet.");
+});
+
+document.getElementById("b-csv").addEventListener("click", function(){
+  if(!S.log.length){ document.getElementById("recinfo").textContent = "Noch nichts aufgezeichnet."; return; }
+  var kopf = "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
+  var text = kopf + S.log.map(function(r){ return r.join(","); }).join("\n");
+  var url = URL.createObjectURL(new Blob([text], {type:"text/csv"}));
+  var a = document.createElement("a");
+  a.href = url; a.download = "fahrt.csv"; a.click();
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 2000);
+  document.getElementById("recinfo").textContent = S.log.length + " Messpunkte gespeichert.";
+});
+</script>
+</body>
+</html>
