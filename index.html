@@ -482,6 +482,16 @@ function scanWindow(vw, vh){
   if(t && t.misses < 3)
     return clampWin(t.x + t.w/2, t.y + t.h/2, Math.max(t.w*3.4, vw*0.20), vw, vh);
   scanIdx = (scanIdx + 1) % 4;
+  /* Weit entfernte Fahrzeuge stehen immer an einer Stelle: dort, wo die
+     Fahrbahn zusammenlaeuft. Ist die Spur erkannt, kennen wir diesen Punkt
+     und koennen dort das engste Feld aufziehen - genau dort, wo ein Auto nur
+     noch dreissig Pixel breit ist und im grossen Feld untergehen wuerde. */
+  var lane = S.lane;
+  if(scanIdx === 0 && lane && isFinite(lane.yV)){
+    var vx = lane.xV * lane.sc, vy = lane.yV * lane.sc;
+    if(vy > -vh*0.5 && vy < vh)
+      return clampWin(vx, vy + vw*0.05, vw*0.30, vw, vh);
+  }
   if(scanIdx === 3) return clampWin(vw/2, vh*0.60, Math.min(vw, vh), vw, vh, true);
   return clampWin(vw/2, vh*scanYs[scanIdx], vw*0.55, vw, vh);
 }
