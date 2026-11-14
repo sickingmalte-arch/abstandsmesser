@@ -210,6 +210,13 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.30</b></label>
     <input type="range" id="i-conf" min="0.15" max="0.8" step="0.05" value="0.30">
 
+    <label for="i-res">Kamerastrom</label>
+    <select id="i-res">
+      <option value="hoch" selected>groß — 1920 × 1080</option>
+      <option value="klein">klein — 1280 × 720, spart Wärme</option>
+    </select>
+    <p class="hint">Kostet kaum Genauigkeit: Fahrzeug, Suchfeld und Modelleingang schrumpfen gemeinsam, die Messunsicherheit bleibt bei beiden rund fünf Prozent. Prüf nach dem Umstellen den Blickwinkel hier oben — liefert deine Kamera für die kleinere Auflösung einen anderen Bildausschnitt, musst du einmal neu kalibrieren.</p>
+
     <label for="i-takt">Takt der Auswertung</label>
     <select id="i-takt">
       <option value="0" selected>so schnell wie möglich</option>
@@ -304,6 +311,7 @@ var S = {
   fov:69.7, realW:1.80, conf:0.30, boost:true,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
   win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"", minPeriod:0,
+  res:"hoch", laneTick:0,
   lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
@@ -357,6 +365,34 @@ function beep(urgent){
 }
 
 /* ---------------- Kamera ---------------- */
+function camConstraints(){
+  var gross = S.res === "hoch";
+  return { video:{ facingMode:{ideal:"environment"},
+                   width:{ideal: gross ? 1920 : 1280},
+                   height:{ideal: gross ? 1080 : 720} }, audio:false };
+}
+
+/* Ein kleinerer Kamerastrom kostet fast nichts an Genauigkeit: Fahrzeug,
+   Suchfeld und Modelleingang schrumpfen gemeinsam, die Messunsicherheit
+   bleibt bei beiden Aufloesungen bei rund fuenf Prozent. Er spart aber
+   Bildverarbeitung und damit Waerme. */
+async function setRes(v){
+  S.res = v;
+  if(!S.running) return;
+  try{
+    var alt = video.srcObject;
+    var neu = await navigator.mediaDevices.getUserMedia(camConstraints());
+    video.srcObject = neu;
+    await video.play();
+    if(alt) alt.getTracks().forEach(function(t){ t.stop(); });
+    prevGray = null; rowMove = null; S.lane = null;
+    S.track = null; kf.reset(); S.learnedN = 0;
+    showOptik();
+  }catch(e){
+    status("Auflösung ließ sich nicht umstellen (" + e.name + ").", "err");
+  }
+}
+
 async function start(){
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     status("Dieser Browser gibt keinen Kamerazugriff frei. Die Seite muss über https:// laufen — bei einer lokal geöffneten Datei sperrt der Browser die Kamera.", "err");
@@ -368,10 +404,7 @@ async function start(){
   }
   status("Frage Kamera an …");
   try{
-    var stream = await navigator.mediaDevices.getUserMedia({
-      video:{ facingMode:{ideal:"environment"}, width:{ideal:1920}, height:{ideal:1080} },
-      audio:false
-    });
+    var stream = await navigator.mediaDevices.getUserMedia(camConstraints());
     video.srcObject = stream;
     await video.play();
   }catch(e){
@@ -920,7 +953,13 @@ async function detectLoop(){
 
       // Ein Bild holen, das sich Nachtmodus und Spurerkennung teilen
       var fr = (S.mode !== "day" || S.lanes) ? grabFrame() : null;
-      S.lane = (S.lanes && fr) ? laneDetect(fr) : null;
+      /* Die Spur muss nicht in jedem Durchlauf neu gesucht werden: sie
+         aendert sich langsam, und jede Suche kostet Rechenzeit und damit
+         Waerme. Das Bewegungsprofil wird trotzdem in jedem Durchlauf
+         fortgeschrieben, sonst verliert es seinen Takt. */
+      S.laneTick++;
+      if(!S.lanes) S.lane = null;
+      else if(fr && S.laneTick % 2 === 0) S.lane = laneDetect(fr);
       if(fr && (S.mode === "night" || (S.mode === "auto" && S.lum < 115)))
         nres = nightDetect(fr);
       /* In der Daemmerung ist es fuer das Modell schon zu dunkel, fuer eine
@@ -1009,7 +1048,12 @@ async function detectLoop(){
         var dRaw = distFromBox(lead.w, realW, f);
         /* Unsicherheit ehrlich angeben: die Boxkanten zittern um gut zwei
            Pixel; bei einer angeschnittenen Box ist es erheblich mehr. */
-        var wobble = lead.cut ? Math.max(6, lead.w*0.12) : 2;
+        /* Die Box kommt aus dem Modell mit 320 Punkten Kantenlaenge und wird
+           auf das Bild zurueckgerechnet. Die Unschaerfe gehoert also zum
+           Suchfeld, nicht zum Kamerabild - sie waechst mit dem Feld und
+           bleibt bei kleinerer Aufloesung prozentual gleich. */
+        var basis = S.win ? Math.max(2, 1.5*S.win.w/SCAN) : 2;
+        var wobble = lead.cut ? Math.max(basis*3, lead.w*0.12) : basis;
         S.err = Math.abs(distFromBox(Math.max(2, lead.w - wobble), realW, f) - dRaw);
         if(S.calibrating){
           finishCalib(lead.w);
@@ -1034,7 +1078,12 @@ async function detectLoop(){
        zu Waerme - ist es erst heiss, drosselt Android von selbst, und dann
        sinkt die Bildrate gerade dann, wenn man sie braucht. Wer weniger
        Bilder je Sekunde hinnimmt, bleibt kuehler und am Ende oft schneller. */
-    var rest = S.minPeriod - (performance.now() - tLoop);
+    /* Steht das Auto, gibt es nichts zu messen. An der Ampel und im Stau
+       sonst minutenlang volle Last, ohne dass sich etwas aendert - das ist
+       die Waerme, die man hinterher am Handy spuert. */
+    var soll = S.minPeriod;
+    if(S.vOwn !== null && S.vOwn < 0.8) soll = Math.max(soll, 800);
+    var rest = soll - (performance.now() - tLoop);
     await new Promise(function(r){ setTimeout(r, rest > 1 ? rest : 1); });
   }
 }
@@ -1307,6 +1356,9 @@ document.getElementById("i-boost").addEventListener("change", function(){
 });
 document.getElementById("i-takt").addEventListener("change", function(){
   S.minPeriod = +this.value;
+});
+document.getElementById("i-res").addEventListener("change", function(){
+  setRes(this.value);
 });
 document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
 document.getElementById("i-mode").addEventListener("change", function(){ S.mode = this.value; kf.reset(); });
