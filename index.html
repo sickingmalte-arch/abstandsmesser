@@ -92,6 +92,7 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <div class="row">
       <div class="cell xl"><div class="k">Abstand</div><div class="v" id="d-dist">—<span class="u">m</span></div></div>
       <div class="cell xl"><div class="k">Zeitlücke</div><div class="v" id="d-gap">—<span class="u">s</span></div></div>
+      <div class="cell xl"><div class="k">Empfehlung</div><div class="v" id="d-rec">—<span class="u">km/h</span></div></div>
     </div>
     <div class="row" style="margin-top:6px">
       <div class="cell"><div class="k">v eigen</div><div class="v" id="d-vown">—<span class="u">km/h</span></div></div>
@@ -169,6 +170,21 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     </select>
     <input type="number" id="i-manspeed" value="100" min="1" max="250" step="1" style="margin-top:8px">
 
+    <label for="i-vset">Wunschgeschwindigkeit in km/h <b>Obergrenze</b></label>
+    <input type="number" id="i-vset" value="100" min="10" max="250" step="5">
+
+    <label for="i-gaptarget">Gewünschte Zeitlücke <b id="l-gaptarget">2,0 s</b></label>
+    <input type="range" id="i-gaptarget" min="1.5" max="4" step="0.1" value="2.0">
+
+    <label for="i-lanes">Spurerkennung</label>
+    <select id="i-lanes">
+      <option value="1">an</option>
+      <option value="0">aus</option>
+    </select>
+
+    <label for="i-lanethr">Empfindlichkeit für Markierungen <b id="l-lanethr">22</b></label>
+    <input type="range" id="i-lanethr" min="8" max="60" step="2" value="22">
+
     <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.45</b></label>
     <input type="range" id="i-conf" min="0.2" max="0.8" step="0.05" value="0.45">
 
@@ -235,6 +251,8 @@ function judge(g){
 var S = {
   fov:69.7, realW:1.80, conf:0.45,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
+  lanes:true, laneThr:22, lane:null,
+  vSet:100, gapTarget:2.0,
   speedMode:"gps", manSpeed:100,
   vOwn:null, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -321,7 +339,8 @@ var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 var nCv = document.createElement("canvas");
 var nCx = nCv.getContext("2d", { willReadFrequently:true });
 
-function nightDetect(){
+/* Ein verkleinertes Bild pro Durchlauf, das sich Nachtmodus und Spurerkennung teilen. */
+function grabFrame(){
   var vw = video.videoWidth, vh = video.videoHeight;
   if(!vw) return null;
   var W = 320, H = Math.max(1, Math.round(vh * W / vw));
@@ -329,14 +348,83 @@ function nightDetect(){
   nCx.drawImage(video, 0, 0, W, H);
   var px;
   try{ px = nCx.getImageData(0, 0, W, H).data; }catch(e){ return null; }
-
-  var n = W*H, mask = new Uint8Array(n), lum = 0, thr = S.redMin;
+  var n = W*H, gray = new Uint8Array(n), lum = 0;
   for(var i=0, j=0; i<n; i++, j+=4){
-    var r=px[j], g=px[j+1], b=px[j+2];
-    lum += r*0.299 + g*0.587 + b*0.114;
-    if(r > thr && r > g*1.5 && r > b*1.5) mask[i] = 1;
+    var v = px[j]*0.299 + px[j+1]*0.587 + px[j+2]*0.114;
+    gray[i] = v; lum += v;
   }
   S.lum = lum / n;
+  return { px:px, gray:gray, W:W, H:H, sc:vw/W };
+}
+
+/* --- Spurerkennung ---
+   Fahrbahnmarkierungen sind helle, schmale Streifen auf dunklem Asphalt.
+   Pro Bildzeile werden helle Abschnitte gesucht, nach links und rechts
+   sortiert und je eine Gerade x = a*y + b hineingelegt. Kein Hough noetig. */
+function fitLine(pts){
+  if(pts.length < 6) return null;
+  function ls(list){
+    var n=list.length, sy=0, sx=0, syy=0, sxy=0;
+    for(var i=0;i<n;i++){ sy+=list[i].y; sx+=list[i].x; syy+=list[i].y*list[i].y; sxy+=list[i].x*list[i].y; }
+    var den = n*syy - sy*sy;
+    if(Math.abs(den) < 1e-6) return null;
+    var a = (n*sxy - sy*sx)/den;
+    return { a:a, b:(sx - a*sy)/n };
+  }
+  var f = ls(pts); if(!f) return null;
+  // Ausreisser einmal verwerfen, dann neu anpassen
+  var res = pts.map(function(p){ return Math.abs(p.x - (f.a*p.y + f.b)); });
+  var mean = res.reduce(function(a,b){return a+b;},0)/res.length;
+  var keep = pts.filter(function(p,i){ return res[i] < Math.max(2.5, mean*2.2); });
+  if(keep.length < 6) return null;
+  var f2 = ls(keep) || f;
+  var r2 = keep.map(function(p){ return Math.abs(p.x - (f2.a*p.y + f2.b)); });
+  var err = r2.reduce(function(a,b){return a+b;},0)/r2.length;
+  if(err > 3.0) return null;                        // zu krumm, keine Markierung
+  f2.n = keep.length;
+  return f2;
+}
+
+function laneDetect(fr){
+  if(!fr) return null;
+  var W = fr.W, H = fr.H, g = fr.gray;
+  var yTop = Math.round(H*0.56), yBot = Math.round(H*0.94);
+  var left = [], right = [];
+  for(var y = yTop; y < yBot; y += 2){
+    var row = y*W, sum = 0, cnt = 0;
+    for(var x = 0; x < W; x++){ sum += g[row+x]; cnt++; }
+    var base = sum/cnt, thr = base + S.laneThr;
+    // Perspektive: weiter oben liegen die Markierungen dichter an der Mitte
+    var frac = (y - yTop) / Math.max(1, yBot - yTop);
+    var span = W * (0.08 + 0.42*frac);
+    var x0 = Math.max(1, Math.round(W/2 - span)), x1 = Math.min(W-2, Math.round(W/2 + span));
+    var runStart = -1, maxRun = Math.max(2, Math.round(W*0.035));
+    for(var xx = x0; xx <= x1; xx++){
+      var hot = g[row+xx] > thr;
+      if(hot && runStart < 0) runStart = xx;
+      if((!hot || xx === x1) && runStart >= 0){
+        var wRun = xx - runStart;
+        if(wRun >= 1 && wRun <= maxRun){
+          var cxr = runStart + wRun/2;
+          (cxr < W/2 ? left : right).push({ x:cxr, y:y });
+        }
+        runStart = -1;
+      }
+    }
+  }
+  var L = fitLine(left), R = fitLine(right);
+  if(!L && !R) return null;
+  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc };
+}
+
+function nightDetect(fr){
+  if(!fr) return null;
+  var W = fr.W, H = fr.H, px = fr.px, n = W*H;
+  var mask = new Uint8Array(n), thr = S.redMin;
+  for(var i=0, j=0; i<n; i++, j+=4){
+    var r=px[j], g2=px[j+1], b=px[j+2];
+    if(r > thr && r > g2*1.5 && r > b*1.5) mask[i] = 1;
+  }
 
   // Zusammenhaengende rote Flaechen finden
   var seen = new Uint8Array(n), stack = [], blobs = [];
@@ -381,7 +469,7 @@ function nightDetect(){
   if(!pairs.length) return { all:[], lead:null };
 
   var best = pairs.reduce(function(a,b){ return b.score > a.score ? b : a; });
-  var sc = vw / W;                                               // zurueck auf Videopixel
+  var sc = fr.sc;                                                // zurueck auf Videopixel
   var top = Math.min(best.L.y, best.R.y), bot = Math.max(best.L.y + best.L.h, best.R.y + best.R.h);
   var lead = {
     x: best.L.cx * sc, y: top * sc,
@@ -402,8 +490,10 @@ async function detectLoop(){
       var vw = video.videoWidth || 1, mid = vw/2, band = vw*0.24;
       var list = [], lead = null, nres = null;
 
-      // Helligkeit messen und ggf. Nachtmodus fahren
-      if(S.mode !== "day") nres = nightDetect();
+      // Ein Bild holen, das sich Nachtmodus und Spurerkennung teilen
+      var fr = (S.mode !== "day" || S.lanes) ? grabFrame() : null;
+      S.lane = (S.lanes && fr) ? laneDetect(fr) : null;
+      if(S.mode !== "day" && fr) nres = nightDetect(fr);
       var useNight = (S.mode === "night") ||
                      (S.mode === "auto" && nres && S.lum < 62);
       var modeNow = useNight ? "night" : "day";
@@ -482,6 +572,26 @@ function draw(){
   var j = judge(gap);
   var col = j.c === "crit" ? "#FF4D4D" : (j.c === "warn" ? "#F5C542" : "#35D07F");
 
+  // Fahrspur gruen hinterlegen
+  if(S.lane){
+    var lane = S.lane, k = lane.sc;
+    var pt = function(f, yy){ return { x:X((f.a*yy + f.b)*k), y:Y(yy*k) }; };
+    if(lane.L && lane.R){
+      var l0=pt(lane.L,lane.yBot), l1=pt(lane.L,lane.yTop),
+          r0=pt(lane.R,lane.yBot), r1=pt(lane.R,lane.yTop);
+      cx.fillStyle = "rgba(53,208,127,.13)";
+      cx.beginPath(); cx.moveTo(l0.x,l0.y); cx.lineTo(l1.x,l1.y);
+      cx.lineTo(r1.x,r1.y); cx.lineTo(r0.x,r0.y); cx.closePath(); cx.fill();
+    }
+    cx.strokeStyle = "#35D07F"; cx.lineWidth = 5; cx.lineCap = "round";
+    [lane.L, lane.R].forEach(function(f){
+      if(!f) return;
+      var a0 = pt(f, lane.yBot), a1 = pt(f, lane.yTop);
+      cx.beginPath(); cx.moveTo(a0.x, a0.y); cx.lineTo(a1.x, a1.y); cx.stroke();
+    });
+    cx.lineCap = "butt";
+  }
+
   cx.lineWidth = 1.5; cx.strokeStyle = "rgba(150,160,165,.5)";
   S.dets.forEach(function(b){
     if(b === S.lead) return;
@@ -531,12 +641,28 @@ function draw(){
   set("d-mode", S.model || S.activeMode === "night"
       ? (S.activeMode === "night" ? "Nacht" : "Tag")
       : "Hand");
+  /* Empfehlung wie bei einem Abstandsregeltempomaten:
+     Die Geschwindigkeit des Vordermanns, korrigiert um die Abstandsabweichung,
+     begrenzt auf die selbst gesetzte Wunschgeschwindigkeit. */
+  var recWord = "";
+  if(S.lead && S.lead.dist && isFinite(dv)){
+    var vLead = vo + S.lead.vRel;
+    var dSoll = S.gapTarget * vo;
+    var vRec = Math.max(0, Math.min(S.vSet/3.6, vLead + (S.lead.dist - dSoll)/8));
+    var zu = vRec < vo - 0.7, schneller = vRec > vo + 0.7;
+    recWord = zu ? "langsamer werden" : (schneller ? "freie Fahrt" : "Tempo halten");
+    set("d-rec", Math.round(vRec*3.6), zu ? "warn" : "good");
+  } else {
+    set("d-rec", "—");
+  }
+
   var ve = document.getElementById("verdict");
   if(!S.model && !S.lead){
     ve.textContent = "Handbetrieb — Rechteck über die Fahrzeugbreite ziehen";
     ve.className = "";
   } else {
-    ve.textContent = j.t; ve.className = j.c;
+    ve.textContent = j.t + (recWord ? " · " + recWord : "");
+    ve.className = j.c;
   }
 }
 
@@ -634,6 +760,19 @@ document.getElementById("i-span").addEventListener("input", function(){ S.lightS
 document.getElementById("i-red").addEventListener("input", function(){
   S.redMin = +this.value;
   document.getElementById("l-red").textContent = this.value;
+});
+document.getElementById("i-vset").addEventListener("input", function(){ S.vSet = +this.value; });
+document.getElementById("i-gaptarget").addEventListener("input", function(){
+  S.gapTarget = +this.value;
+  document.getElementById("l-gaptarget").textContent = (+this.value).toFixed(1).replace(".",",") + " s";
+});
+document.getElementById("i-lanes").addEventListener("change", function(){
+  S.lanes = this.value === "1";
+  if(!S.lanes) S.lane = null;
+});
+document.getElementById("i-lanethr").addEventListener("input", function(){
+  S.laneThr = +this.value;
+  document.getElementById("l-lanethr").textContent = this.value;
 });
 document.getElementById("i-conf").addEventListener("input", function(){
   S.conf = +this.value;
