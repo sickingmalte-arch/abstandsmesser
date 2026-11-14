@@ -98,6 +98,7 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <div class="cell"><div class="k">v eigen</div><div class="v" id="d-vown">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">v vorn</div><div class="v" id="d-vlead">—<span class="u">km/h</span></div></div>
       <div class="cell"><div class="k">Δv</div><div class="v" id="d-dv">—<span class="u">km/h</span></div></div>
+      <div class="cell"><div class="k">Genauigkeit</div><div class="v" id="d-err">—</div></div>
       <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
       <div class="cell"><div class="k">Modus</div><div class="v" id="d-mode" style="font-size:.95rem">—</div></div>
     </div>
@@ -185,6 +186,25 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <label for="i-lanethr">Empfindlichkeit für Markierungen <b id="l-lanethr">22</b></label>
     <input type="range" id="i-lanethr" min="8" max="60" step="2" value="22">
 
+    <label for="i-lanew">Fahrstreifenbreite in m <b>für den Maßstab</b></label>
+    <input type="number" id="i-lanew" value="3.5" min="2" max="5" step="0.05">
+
+    <label for="i-sound">Warnton</label>
+    <select id="i-sound">
+      <option value="1">an</option>
+      <option value="0">aus</option>
+    </select>
+
+    <label for="i-warngap">Warnen unter <b id="l-warngap">1,8 s</b></label>
+    <input type="range" id="i-warngap" min="1.0" max="3.0" step="0.1" value="1.8">
+
+    <label for="i-vol">Lautstärke <b id="l-vol">25 %</b></label>
+    <input type="range" id="i-vol" min="0.05" max="1" step="0.05" value="0.25">
+
+    <div class="btns" style="margin-top:10px">
+      <button id="b-testbeep">Warnton testen</button>
+    </div>
+
     <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.45</b></label>
     <input type="range" id="i-conf" min="0.2" max="0.8" step="0.05" value="0.45">
 
@@ -251,8 +271,10 @@ function judge(g){
 var S = {
   fov:69.7, realW:1.80, conf:0.45,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
-  lanes:true, laneThr:22, lane:null,
+  lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
+  sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
+  track:null, learnedW:0, learnedN:0, srcLane:false, err:0,
   speedMode:"gps", manSpeed:100,
   vOwn:null, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -267,6 +289,38 @@ var cx = cv.getContext("2d");
 function status(msg, cls){
   var el = document.getElementById("status");
   el.textContent = msg; el.className = cls || "";
+}
+
+/* ---------------- Warnton ----------------
+   Auf dem Display nachzusehen ist genau das, was man im Auto nicht tun soll.
+   Deshalb warnt die Zeitluecke akustisch, mit Sperrzeit gegen Dauerpiepen. */
+var actx = null;
+function audioInit(){
+  try{
+    if(!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    if(actx.state === "suspended") actx.resume();
+  }catch(e){ actx = null; }
+}
+function tone(at, freq, dur){
+  var o = actx.createOscillator(), g = actx.createGain();
+  o.type = "sine"; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, at);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.001, S.vol), at + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, at + dur);
+  o.connect(g); g.connect(actx.destination);
+  o.start(at); o.stop(at + dur + 0.03);
+}
+function beep(urgent){
+  if(!S.sound || !actx) return;
+  var now = performance.now();
+  if(now - S.lastBeep < (urgent ? 1100 : 2600)) return;
+  S.lastBeep = now;
+  try{
+    if(actx.state === "suspended") actx.resume();
+    var t = actx.currentTime;
+    tone(t, urgent ? 1180 : 840, 0.1);
+    if(urgent) tone(t + 0.17, 1180, 0.1);
+  }catch(e){}
 }
 
 /* ---------------- Kamera ---------------- */
@@ -303,7 +357,11 @@ async function start(){
   }
 
   startGps();
-  try{ if(navigator.wakeLock) await navigator.wakeLock.request("screen"); }catch(e){}
+  audioInit();
+  keepAwake();
+  document.addEventListener("visibilitychange", function(){
+    if(document.visibilityState === "visible"){ keepAwake(); audioInit(); }
+  });
 
   document.getElementById("start").hidden = true;
   if(!S.model){
@@ -312,6 +370,18 @@ async function start(){
   S.running = true;
   detectLoop();
   requestAnimationFrame(draw);
+}
+
+/* Die Bildschirmsperre wird beim Appwechsel freigegeben und muss neu
+   angefordert werden, sonst geht das Display mitten in der Fahrt aus. */
+var wakeRef = null;
+async function keepAwake(){
+  try{
+    if(!navigator.wakeLock) return;
+    if(wakeRef && !wakeRef.released) return;
+    wakeRef = await navigator.wakeLock.request("screen");
+    wakeRef.addEventListener("release", function(){ wakeRef = null; });
+  }catch(e){}
 }
 
 function startGps(){
@@ -413,8 +483,21 @@ function laneDetect(fr){
     }
   }
   var L = fitLine(left), R = fitLine(right);
+
+  /* Plausibilitaet: die beiden Linien muessen sich nach oben annaehern,
+     duerfen sich im Bildausschnitt nicht kreuzen und muessen unten eine
+     Fahrbahnbreite ergeben, die ueberhaupt sein kann. */
+  if(L && R){
+    var spanBot = (R.a*yBot + R.b) - (L.a*yBot + L.b);
+    var spanTop = (R.a*yTop + R.b) - (L.a*yTop + L.b);
+    var bad = spanBot <= W*0.10 ||          // unten zu schmal
+              spanTop <= 2 ||                // oben gekreuzt
+              spanTop >= spanBot ||          // laufen nicht zusammen
+              spanBot > W*1.5;               // unten unmoeglich breit
+    if(bad){ if(L.n >= R.n) R = null; else L = null; }
+  }
   if(!L && !R) return null;
-  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc };
+  return { L:L, R:R, yTop:yTop, yBot:yBot, sc:fr.sc, W:W };
 }
 
 function nightDetect(fr){
@@ -484,6 +567,57 @@ function nightDetect(fr){
   return { all:all, lead:lead };
 }
 
+/* --- Zielverfolgung ueber Bilder hinweg ---
+   Ohne sie springt die Auswahl zwischen Fahrzeugen hin und her, und der
+   Kalman-Filter haelt den Sprung fuer eine rasante Annaeherung. */
+function pickTarget(cands, vw){
+  if(!cands.length){
+    if(S.track){
+      S.track.misses++;
+      if(S.track.misses > 6){ S.track = null; kf.reset(); S.learnedN = 0; }
+    }
+    return null;
+  }
+  var mid = vw/2, best = null, bestScore = -1e9;
+  if(S.track){
+    var t = S.track;
+    cands.forEach(function(c){
+      var dcx = Math.abs((c.x + c.w/2) - (t.x + t.w/2)) / vw;
+      var dw  = Math.abs(c.w - t.w) / Math.max(t.w, 1);
+      var sc = 1 - (dcx*3.0 + dw*1.2);
+      if(sc > bestScore){ bestScore = sc; best = c; }
+    });
+    if(bestScore < 0.45) best = null;          // passt nicht mehr zum Ziel
+  }
+  if(!best){
+    best = cands.reduce(function(a,b){
+      var sa = a.w - Math.abs(a.x + a.w/2 - mid)/vw * a.w * 2;
+      var sb = b.w - Math.abs(b.x + b.w/2 - mid)/vw * b.w * 2;
+      return sb > sa ? b : a;
+    });
+    if(S.track) kf.reset();                    // echter Zielwechsel
+    S.track = { x:best.x, y:best.y, w:best.w, h:best.h, misses:0, age:0 };
+    S.learnedW = 0; S.learnedN = 0;            // gelernte Breite galt dem alten Ziel
+  } else {
+    S.track.x = best.x; S.track.y = best.y;
+    S.track.w = best.w; S.track.h = best.h;
+    S.track.misses = 0; S.track.age++;
+  }
+  return best;
+}
+
+/* Abstand aus der Fahrbahnbreite an der Stelle, wo das Fahrzeug aufsetzt. */
+function laneDistance(bottomVideoY){
+  var lane = S.lane;
+  if(!lane || !lane.L || !lane.R) return null;
+  var ys = bottomVideoY / lane.sc, hgt = lane.yBot - lane.yTop;
+  if(ys < lane.yTop - hgt*0.25 || ys > lane.yBot + 6) return null;
+  var span = (lane.R.a*ys + lane.R.b) - (lane.L.a*ys + lane.L.b);
+  if(span < 3) return null;
+  var d = focalPx(lane.W, S.fov) * S.laneW / span;
+  return (d > 2 && d < 150) ? d : null;
+}
+
 async function detectLoop(){
   while(S.running){
     if(video.readyState >= 2){
@@ -502,7 +636,9 @@ async function detectLoop(){
       if(useNight){
         list = nres ? nres.all : [];
         lead = nres ? nres.lead : null;
-        S.dets = list;
+        if(lead) list = list.concat([lead]);
+        S.dets = nres ? nres.all : [];
+        lead = pickTarget(lead ? [lead] : [], vw);
       } else if(S.model){
         var preds;
         try{ preds = await S.model.detect(video, 12); }catch(e){ preds = []; }
@@ -513,7 +649,7 @@ async function detectLoop(){
         }
         S.dets = list;
         var cand = list.filter(function(b){ return Math.abs(b.x + b.w/2 - mid) < band; });
-        lead = cand.length ? cand.reduce(function(a,b){ return b.w > a.w ? b : a; }) : null;
+        lead = pickTarget(cand, vw);
       } else {
         S.dets = [];
         await new Promise(function(r){ setTimeout(r, 150); });
@@ -527,9 +663,28 @@ async function detectLoop(){
 
       if(lead){
         var f = focalPx(vw, S.fov);
+
+        /* Massstab aus der Fahrbahnbreite: Dort, wo die Raeder des Vordermanns
+           die Fahrbahn beruehren, spannen die Markierungen eine bekannte Breite
+           auf. Daraus laesst sich die tatsaechliche Fahrzeugbreite lernen,
+           statt sie mit 1,80 m zu raten. */
+        var dLane = laneDistance(lead.y + lead.h);
+        S.srcLane = false;
+        if(dLane && lead.cls !== "lights" && !S.calibrating){
+          var implied = dLane * lead.w / f;
+          if(implied > 1.3 && implied < 2.8){
+            S.learnedN++;
+            S.learnedW = S.learnedN === 1 ? implied : S.learnedW*0.93 + implied*0.07;
+            S.srcLane = true;
+          }
+        }
+
         var realW = S.calibrating ? S.calWidth
-                  : (lead.cls === "lights" ? S.lightSpan : (REALW[lead.cls] || S.realW));
+                  : (lead.cls === "lights" ? S.lightSpan
+                  : (S.learnedN >= 10 ? S.learnedW : (REALW[lead.cls] || S.realW)));
         var dRaw = distFromBox(lead.w, realW, f);
+        // Unsicherheit: Boxkanten zittern um etwa zwei Pixel
+        S.err = Math.abs(distFromBox(Math.max(2, lead.w - 2), realW, f) - dRaw);
         if(S.calibrating){
           finishCalib(lead.w, vw);
         } else {
@@ -543,7 +698,7 @@ async function detectLoop(){
           }
         }
       } else {
-        kf.reset();
+        S.err = 0;
       }
       S.lead = lead;
     }
@@ -632,15 +787,32 @@ function draw(){
 
   // Anzeigen
   var vo = ownSpeed(), dv = S.lead && S.lead.vRel !== undefined ? S.lead.vRel*3.6 : NaN;
-  set("d-dist", S.lead && S.lead.dist ? fmt(S.lead.dist,1) : "—", j.c);
+  /* So genau anzeigen, wie gemessen wurde - nicht genauer.
+     Bei 50 m liegt der Fehler schon ueber einem Meter. */
+  var dShow = "—", eShow = "—";
+  if(S.lead && S.lead.dist){
+    var e = Math.max(0.05, S.err);
+    var step = e < 0.25 ? 0.1 : (e < 0.8 ? 0.5 : (e < 2.5 ? 1 : 5));
+    var dec = step < 1 ? 1 : 0;
+    dShow = fmt(Math.round(S.lead.dist/step)*step, dec);
+    eShow = "±" + fmt(e, e < 1 ? 1 : 0);
+  }
+  set("d-dist", dShow, j.c);
+  set("d-err", eShow);
   set("d-gap", isFinite(gap) ? fmt(gap,2) : "—", j.c);
+
+  // Akustische Warnung - wichtiger als jede Zahl, weil man hinsehen muesste
+  if(S.lead && isFinite(gap) && gap < S.warnGap){
+    beep(gap < S.warnGap*0.65 || (S.lead.vRel < -2 && gap < S.warnGap*1.15));
+  }
   set("d-vown", Math.round(vo*3.6) + (S.speedMode==="gps" && S.vOwn!==null ? "" : "*"));
   set("d-vlead", isFinite(dv) ? Math.round(vo*3.6+dv) : "—");
   set("d-dv", isFinite(dv) ? (dv>=0?"+":"") + fmt(dv,1) : "—", dv < -2 ? "warn" : "");
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
-  set("d-mode", S.model || S.activeMode === "night"
-      ? (S.activeMode === "night" ? "Nacht" : "Tag")
-      : "Hand");
+  var modeTxt = S.model || S.activeMode === "night"
+      ? (S.activeMode === "night" ? "Nacht" : "Tag") : "Hand";
+  if(S.learnedN >= 10) modeTxt += "·Spur";
+  set("d-mode", modeTxt);
   /* Empfehlung wie bei einem Abstandsregeltempomaten:
      Die Geschwindigkeit des Vordermanns, korrigiert um die Abstandsabweichung,
      begrenzt auf die selbst gesetzte Wunschgeschwindigkeit. */
@@ -773,6 +945,24 @@ document.getElementById("i-lanes").addEventListener("change", function(){
 document.getElementById("i-lanethr").addEventListener("input", function(){
   S.laneThr = +this.value;
   document.getElementById("l-lanethr").textContent = this.value;
+});
+document.getElementById("i-lanew").addEventListener("input", function(){
+  S.laneW = +this.value; S.learnedN = 0;
+});
+document.getElementById("i-sound").addEventListener("change", function(){
+  S.sound = this.value === "1";
+  if(S.sound) audioInit();
+});
+document.getElementById("i-warngap").addEventListener("input", function(){
+  S.warnGap = +this.value;
+  document.getElementById("l-warngap").textContent = (+this.value).toFixed(1).replace(".",",") + " s";
+});
+document.getElementById("i-vol").addEventListener("input", function(){
+  S.vol = +this.value;
+  document.getElementById("l-vol").textContent = Math.round(this.value*100) + " %";
+});
+document.getElementById("b-testbeep").addEventListener("click", function(){
+  audioInit(); S.lastBeep = 0; beep(true);
 });
 document.getElementById("i-conf").addEventListener("input", function(){
   S.conf = +this.value;
