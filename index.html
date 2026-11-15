@@ -164,6 +164,10 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <label for="i-span">Rückleuchtenabstand, Mitte zu Mitte, in m <b>Nacht</b></label>
     <input type="number" id="i-span" value="1.35" min="0.5" max="3" step="0.01">
 
+    <label for="i-camh">Höhe der Kameralinse über der Fahrbahn in m</label>
+    <input type="number" id="i-camh" value="1.25" min="0.6" max="2.2" step="0.01">
+    <p class="hint">Einmal mit dem Maßband von der Fahrbahn bis zur Linse messen, während das Handy in der Halterung steckt. Damit rechnet die App die <em>echte</em> Breite des Vordermanns aus, auch wo keine Fahrbahnmarkierung liegt — und verlässt sich nicht mehr auf die geratenen 1,80 m. <b id="l-geo">noch nichts gelernt</b></p>
+
     <label for="i-red">Empfindlichkeit für Rot <b id="l-red">80</b></label>
     <input type="range" id="i-red" min="40" max="180" step="5" value="80">
 
@@ -319,6 +323,7 @@ var S = {
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
   track:null, learnedW:0, learnedN:0, srcLane:false, err:0,
   wUsed:0, wGelernt:false, hochHeck:false,
+  camHeight:1.25, yVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -588,9 +593,13 @@ function scanWindow(vw, vh){
      und koennen dort das engste Feld aufziehen - genau dort, wo ein Auto nur
      noch dreissig Pixel breit ist und im grossen Feld untergehen wuerde. */
   var lane = S.lane;
-  if(scanIdx === 0 && lane && isFinite(lane.yV)){
-    var vx = lane.xV * lane.sc, vy = lane.yV * lane.sc;
-    if(vy > -vh*0.5 && vy < vh)
+  if(scanIdx === 0){
+    /* Das ferne Fenster gehoert an den Fluchtpunkt. Liegt keine Spur vor,
+       tut es der aus den Erkennungen gelernte genauso. */
+    var vx = null, vy = null;
+    if(lane && isFinite(lane.yV)){ vx = lane.xV * lane.sc; vy = lane.yV * lane.sc; }
+    else if(S.yVgeo !== null){ vx = vw/2; vy = S.yVgeo; }
+    if(vy !== null && vy > -vh*0.5 && vy < vh)
       return clampWin(vx, vy + vw*0.05, vw*0.30, vw, vh);
   }
   if(scanIdx === 3) return clampWin(vw/2, vh*0.60, Math.min(vw, vh), vw, vh, true);
@@ -935,6 +944,70 @@ function nightDetect(fr){
 /* --- Zielverfolgung ueber Bilder hinweg ---
    Ohne sie springt die Auswahl zwischen Fahrzeugen hin und her, und der
    Kalman-Filter haelt den Sprung fuer eine rasante Annaeherung. */
+/* --- Fluchtpunkt und Fahrzeugbreite aus den Erkennungen selbst ---
+   Fuer ein Fahrzeug der Breite W in der Entfernung d gilt im Bild
+       w  = f*W/d                 (Boxbreite)
+       yU = yV + f*h/d            (Unterkante, yV Fluchtpunkt, h Kamerahoehe)
+   Beides haengt an 1/d, also ist yU eine GERADE ueber w:
+       yU = yV + (h/W) * w
+   Aus vielen Messungen desselben Ziels in verschiedenen Entfernungen
+   ergeben sich daraus der Fluchtpunkt und das Verhaeltnis h/W - ohne eine
+   einzige Fahrbahnmarkierung. Genau das fehlt auf Landstrassen und in
+   Ortsdurchfahrten, wo nichts auf dem Asphalt steht. Ist die Kamerahoehe
+   einmal mit dem Massband gemessen, folgt aus der Steigung die echte
+   Breite des Vordermanns. */
+var geoFit = null;
+function geoReset(){
+  geoFit = { n:0, sw:0, sy:0, sww:0, swy:0, syy:0, wMin:1e9, wMax:0, lw:0, lx:0 };
+}
+geoReset();
+
+function geoSammeln(w, yU, cx, vh){
+  var g = geoFit;
+  /* An seiner echten Tagfahrt gemessen: wird einfach alles gesammelt, was
+     als Ziel gilt, springt die Verfolgung zwischendurch auf ein anderes
+     Fahrzeug - und eine Gerade durch zwei verschieden breite Autos in
+     verschiedenen Entfernungen hat eine falsche Steigung. Sie sah dort
+     mit 10,7 px Reststreuung sogar sauber aus und ergab 2,77 m. Ein
+     durchgehend verfolgtes Fahrzeug ergab 1,97 m bei 5,0 px. Deshalb
+     zaehlt hier nur eine LUECKENLOSE Reihe: springt der Rahmen in der
+     Breite oder seitlich, faengt die Messreihe von vorn an. */
+  if(g.n){
+    var sprungW = Math.abs(w - g.lw) > 0.25*Math.max(w, g.lw);
+    var sprungX = Math.abs(cx - g.lx) > 0.6*Math.max(w, g.lw);
+    if(sprungW || sprungX){
+      geoReset();
+      S.geoW = 0; S.geoN = 0;      // anderes Fahrzeug, andere Breite
+    }
+    g = geoFit;
+  }
+  g.lw = w; g.lx = cx;
+  g.n++; g.sw += w; g.sy += yU; g.sww += w*w; g.swy += w*yU; g.syy += yU*yU;
+  if(w < g.wMin) g.wMin = w;
+  if(w > g.wMax) g.wMax = w;
+  /* Genug Punkte, und das Ziel muss dabei seine Groesse deutlich geaendert
+     haben - aus lauter gleich weit entfernten Messungen laesst sich keine
+     Gerade bestimmen. */
+  if(g.n < 30 || g.wMax - g.wMin < g.wMax*0.30) return;
+  var den = g.n*g.sww - g.sw*g.sw;
+  if(Math.abs(den) < 1e-6) return;
+  var a = (g.n*g.swy - g.sw*g.sy)/den;
+  var b = (g.sy - a*g.sw)/g.n;
+  if(!(a > 0)) return;
+  /* Die Steigung ist h/W. Statt sie abstrakt zu begrenzen, wird gefragt,
+     welche Fahrzeugbreite sie bedeutet - alles ausserhalb von Kleinwagen
+     bis Lkw ist ein Zeichen dafuer, dass die Reihe nicht sauber war. */
+  var Wimp = S.camHeight / a;
+  if(!(Wimp > 1.40 && Wimp < 2.80)) return;
+  if(!(b > vh*0.08 && b < vh*0.95)) return;
+  /* Und die Punkte muessen wirklich auf der Geraden liegen. */
+  var rms = Math.sqrt(Math.max(0, (g.syy - b*g.sy - a*g.swy)) / Math.max(1, g.n - 2));
+  if(rms > vh*0.006) return;
+  S.geoRms = rms;
+  S.yVgeo = S.yVgeo === null ? b : S.yVgeo*0.82 + b*0.18;
+  S.yVn++;
+}
+
 /* Mitte der eigenen Spur auf Hoehe eines Bildpunktes. In der Kurve steht der
    Vordermann nicht in der Bildmitte - sucht man ihn dort, verliert man ihn
    genau dann, wenn es interessant wird. */
@@ -974,6 +1047,7 @@ function pickTarget(cands, vw){
     if(S.track) kf.reset();                    // echter Zielwechsel
     S.track = { x:best.x, y:best.y, w:best.w, h:best.h, misses:0, age:0 };
     S.learnedW = 0; S.learnedN = 0;            // gelernte Breite galt dem alten Ziel
+    S.geoW = 0; S.geoN = 0; geoReset();        // und die Geometrie auch
   } else {
     S.track.x = best.x; S.track.y = best.y;
     S.track.w = best.w; S.track.h = best.h;
@@ -1162,10 +1236,44 @@ async function detectLoop(){
           }
         }
 
+        /* Dasselbe noch einmal, aber ohne jede Markierung. Wo der Asphalt
+           nackt ist - Ortsdurchfahrt, Landstrasse, frisch gedeckte Decke -
+           traegt der Massstab aus der Fahrbahnbreite nicht. Die Gerade
+           yU = yV + (h/W)*w traegt dort trotzdem: sie braucht nur denselben
+           Vordermann in verschiedenen Entfernungen. Aus ihr faellt zuerst
+           der Fluchtpunkt heraus, und mit der einmal gemessenen Kamerahoehe
+           dann die echte Breite dieses Fahrzeugs. */
+        if(lead.cls !== "lights" && !lead.cut && !S.calibrating){
+          if(dLane && S.lane && isFinite(S.lane.yV)){
+            /* Liegt eine Spur vor, ist deren Fluchtpunkt der bessere: er
+               kommt aus zwei langen Linien statt aus einer Punktwolke. */
+            var yVl = S.lane.yV * S.lane.sc;
+            S.yVgeo = S.yVgeo === null ? yVl : S.yVgeo*0.7 + yVl*0.3;
+            S.yVn++;
+          }
+          geoSammeln(lead.w, lead.y + lead.h, lead.x + lead.w/2, vh);
+          if(S.yVgeo !== null){
+            var dyG = (lead.y + lead.h) - S.yVgeo;
+            if(dyG > vh*0.015){            // darunter waere der Hebel zu kurz
+              var wGeo = S.camHeight * lead.w / dyG;
+              if(wGeo > 1.35 && wGeo < 2.80){
+                /* Nahe Messungen wiegen schwerer: ihr Hebel ist laenger,
+                   ein Punkt Fehler im Fluchtpunkt faellt dort weniger ins
+                   Gewicht. lead.w ist das direkte Mass dafuer. */
+                var gw = Math.min(0.12, lead.w/1200);
+                S.geoW = S.geoN ? S.geoW*(1 - gw) + wGeo*gw : wGeo;
+                S.geoN++;
+              }
+            }
+          }
+        }
+
         var gelernt = S.learnedN >= 6;
+        var ausGeo = !gelernt && S.geoN >= 15 && S.yVn >= 3;
         var realW = S.calibrating ? S.calWidth
                   : (lead.cls === "lights" ? S.lightSpan
-                  : (gelernt ? S.learnedW : (REALW[lead.cls] || S.realW)));
+                  : (gelernt ? S.learnedW
+                  : (ausGeo ? S.geoW : (REALW[lead.cls] || S.realW))));
         var dRaw = distFromBox(lead.w, realW, f);
 
         /* Die Unsicherheit hat ZWEI Quellen, und bisher stand nur eine da.
@@ -1185,9 +1293,10 @@ async function detectLoop(){
         var ePix = Math.abs(distFromBox(Math.max(2, lead.w - wobble), realW, f) - dRaw);
         var hoch = lead.cls === "car" && lead.h > lead.w;
         var eRel = gelernt ? 0.03
-                 : (lead.cls === "lights" ? 0.10 : (hoch ? 0.18 : 0.055));
+                 : (ausGeo ? 0.05
+                 : (lead.cls === "lights" ? 0.10 : (hoch ? 0.18 : 0.055)));
         S.err = Math.sqrt(ePix*ePix + dRaw*eRel*dRaw*eRel);
-        S.wUsed = realW; S.wGelernt = gelernt; S.hochHeck = hoch;
+        S.wUsed = realW; S.wGelernt = gelernt; S.hochHeck = hoch; S.wGeo = ausGeo;
         if(S.calibrating){
           finishCalib(lead.w);
         } else if(!(dRaw > 2.5 && dRaw < 160)){
@@ -1514,8 +1623,16 @@ function showOptik(){
   var breite = S.wUsed
     ? "<br>Fahrzeugbreite " + fmt(S.wUsed,2) + " m " +
       (S.wGelernt ? "<strong>aus der Spur gelernt</strong>"
-                  : "angenommen" + (S.hochHeck ? " — hohes Heck, vermutlich Transporter" : ""))
+                  : (S.wGeo ? "<strong>aus der Geometrie gemessen</strong>"
+                  : "angenommen" + (S.hochHeck ? " — hohes Heck, vermutlich Transporter" : "")))
     : "";
+  var g = document.getElementById("l-geo");
+  if(g) g.textContent = S.yVgeo === null
+    ? "noch nichts gelernt"
+    : ("Fluchtpunkt bei " + Math.round(S.yVgeo) + " px, Punkte streuen " +
+       fmt(S.geoRms,1) + " px um die Gerade" +
+       (S.geoN >= 15 ? " · Breite " + fmt(S.geoW,2) + " m aus " + S.geoN + " Messungen"
+                     : " · " + S.geoN + " von 15 Messungen"));
   el.innerHTML = "Bild " + vw + "×" + vh + " px · " +
     (vh > vw ? "hochkant" : "quer") + " · Brennweite " + Math.round(f) + " px<br>" +
     "quer über das Bild sind das " + quer.toFixed(1) + "°" +
@@ -1536,6 +1653,10 @@ document.getElementById("i-res").addEventListener("change", function(){
   setRes(this.value);
 });
 document.getElementById("i-width").addEventListener("input", function(){ S.realW = +this.value; });
+document.getElementById("i-camh").addEventListener("input", function(){
+  var v = +this.value;
+  if(v > 0.5 && v < 2.5){ S.camHeight = v; S.geoW = 0; S.geoN = 0; }
+});
 document.getElementById("i-mode").addEventListener("change", function(){ S.mode = this.value; kf.reset(); });
 document.getElementById("i-span").addEventListener("input", function(){ S.lightSpan = +this.value; kf.reset(); });
 document.getElementById("i-red").addEventListener("input", function(){
@@ -1604,7 +1725,9 @@ function csvText(){
     "# blickwinkel_lange_kante=" + S.fov.toFixed(1) +
       " brennweite_px=" + Math.round(f) + "\n" +
     "# fahrzeugbreite=" + (S.wGelernt ? S.learnedW.toFixed(3) + " (aus der Spur gelernt)"
-                                      : (S.wUsed || S.realW).toFixed(2) + " (angenommen)") + "\n" +
+                        : (S.wGeo ? S.geoW.toFixed(3) + " (aus der Geometrie gemessen, Kamerahoehe "
+                                    + S.camHeight.toFixed(2) + " m)"
+                        : (S.wUsed || S.realW).toFixed(2) + " (angenommen)")) + "\n" +
     "# tempoquelle=" + (S.speedMode === "gps" ? "GPS" : "von Hand " + S.manSpeed) +
       " wunschtempo=" + S.vSet + " zielluecke=" + S.gapTarget + "\n" +
     "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
