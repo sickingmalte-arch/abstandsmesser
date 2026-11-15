@@ -317,6 +317,7 @@ var S = {
   vSet:100, gapTarget:2.0,
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
   track:null, learnedW:0, learnedN:0, srcLane:false, err:0,
+  wUsed:0, wGelernt:false, hochHeck:false,
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -979,6 +980,14 @@ function laneDistance(bottomVideoY){
      und die Markierungen auch tatsaechlich gesehen wurden. */
   if(ys < oben - (unten - oben)*0.3 || ys > unten + 6) return null;
   var span = (lane.R.a*ys + lane.R.b) - (lane.L.a*ys + lane.L.b);
+  /* Der Massstab aus der Spur haengt an (y - Fluchtpunkt), und dieser
+     Abstand schrumpft mit der Entfernung: bei 6 m liegt die Zeile 85
+     Bildpunkte unter dem Fluchtpunkt, bei 43 m nur noch 12. Ein halber
+     Punkt Fehler im Fluchtpunkt sind dort schon vier Prozent - gemessen
+     wurden 3,9. Deshalb wird die Fahrzeugbreite nur gelernt, solange der
+     Vordermann nah genug ist; fuenfzehn Prozent der Bildbreite sind etwa
+     dreissig Meter. Die einmal gelernte Breite gilt danach fuer jede
+     Entfernung weiter. */
   if(span < lane.W*0.15) return null;
   // span steckt im verkleinerten Suchbild, deshalb auf Videopixel umrechnen
   var d = focalVideo() * S.laneW / (span * lane.sc);
@@ -1087,19 +1096,32 @@ async function detectLoop(){
           }
         }
 
+        var gelernt = S.learnedN >= 6;
         var realW = S.calibrating ? S.calWidth
                   : (lead.cls === "lights" ? S.lightSpan
-                  : (S.learnedN >= 10 ? S.learnedW : (REALW[lead.cls] || S.realW)));
+                  : (gelernt ? S.learnedW : (REALW[lead.cls] || S.realW)));
         var dRaw = distFromBox(lead.w, realW, f);
-        /* Unsicherheit ehrlich angeben: die Boxkanten zittern um gut zwei
-           Pixel; bei einer angeschnittenen Box ist es erheblich mehr. */
-        /* Die Box kommt aus dem Modell mit 320 Punkten Kantenlaenge und wird
-           auf das Bild zurueckgerechnet. Die Unschaerfe gehoert also zum
-           Suchfeld, nicht zum Kamerabild - sie waechst mit dem Feld und
-           bleibt bei kleinerer Aufloesung prozentual gleich. */
+
+        /* Die Unsicherheit hat ZWEI Quellen, und bisher stand nur eine da.
+           Erstens die Boxkante: sie kommt aus dem Modell mit 320 Punkten
+           Kantenlaenge und wird aufs Bild zurueckgerechnet, zittert also
+           mit der Groesse des Suchfelds.
+           Zweitens, und meist groesser: die angenommene Fahrzeugbreite.
+           Der Abstand haengt direkt daran. Pkw gehen von 1,70 m beim Polo
+           bis 1,90 m beim Kombi - das sind gut fuenf Prozent in beide
+           Richtungen, und sie standen nirgends in der Anzeige. Ist die
+           Breite dagegen aus der Fahrbahnbreite gelernt, faellt dieser
+           Anteil fast weg. Ein Heck, das hoeher als breit ist, waehrend
+           das Modell "Auto" meldet, ist fast immer ein Transporter -
+           dann ist die Annahme von 1,80 m erst recht fraglich. */
         var basis = S.win ? Math.max(2, 1.5*S.win.w/SCAN) : 2;
         var wobble = lead.cut ? Math.max(basis*3, lead.w*0.12) : basis;
-        S.err = Math.abs(distFromBox(Math.max(2, lead.w - wobble), realW, f) - dRaw);
+        var ePix = Math.abs(distFromBox(Math.max(2, lead.w - wobble), realW, f) - dRaw);
+        var hoch = lead.cls === "car" && lead.h > lead.w;
+        var eRel = gelernt ? 0.03
+                 : (lead.cls === "lights" ? 0.10 : (hoch ? 0.18 : 0.055));
+        S.err = Math.sqrt(ePix*ePix + dRaw*eRel*dRaw*eRel);
+        S.wUsed = realW; S.wGelernt = gelernt; S.hochHeck = hoch;
         if(S.calibrating){
           finishCalib(lead.w);
         } else if(!(dRaw > 2.5 && dRaw < 160)){
@@ -1272,7 +1294,8 @@ function draw(){
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
   var modeTxt = S.model || S.activeMode === "night"
       ? (S.activeMode === "night" ? (S.dusk ? "Dämmerung" : "Nacht") : "Tag") : "Hand";
-  if(S.learnedN >= 10) modeTxt += "·Spur";
+  if(S.wGelernt) modeTxt += "·Spur";
+  else if(S.hochHeck) modeTxt += "·hohes Heck";
   set("d-mode", modeTxt);
   /* Empfehlung wie bei einem Abstandsregeltempomaten:
      Die Geschwindigkeit des Vordermanns, korrigiert um die Abstandsabweichung,
@@ -1399,10 +1422,15 @@ function showOptik(){
   if(!vw){ el.textContent = "Kamera läuft noch nicht."; return; }
   var f = focalVideo();
   var quer = 2*Math.atan(vw/(2*f))*180/Math.PI;
+  var breite = S.wUsed
+    ? "<br>Fahrzeugbreite " + fmt(S.wUsed,2) + " m " +
+      (S.wGelernt ? "<strong>aus der Spur gelernt</strong>"
+                  : "angenommen" + (S.hochHeck ? " — hohes Heck, vermutlich Transporter" : ""))
+    : "";
   el.innerHTML = "Bild " + vw + "×" + vh + " px · " +
     (vh > vw ? "hochkant" : "quer") + " · Brennweite " + Math.round(f) + " px<br>" +
     "quer über das Bild sind das " + quer.toFixed(1) + "°" +
-    (S.backend ? " · Rechenwerk " + S.backend : "");
+    (S.backend ? " · Rechenwerk " + S.backend : "") + breite;
 }
 document.getElementById("i-fov").addEventListener("input", function(){
   S.fov = +this.value;
@@ -1486,8 +1514,8 @@ function csvText(){
       " lage=" + ((video.videoHeight||0) > (video.videoWidth||0) ? "hochkant" : "quer") + "\n" +
     "# blickwinkel_lange_kante=" + S.fov.toFixed(1) +
       " brennweite_px=" + Math.round(f) + "\n" +
-    "# fahrzeugbreite=" + (S.learnedN >= 10 ? S.learnedW.toFixed(3) + " (aus der Spur gelernt)"
-                                            : S.realW.toFixed(2) + " (angenommen)") + "\n" +
+    "# fahrzeugbreite=" + (S.wGelernt ? S.learnedW.toFixed(3) + " (aus der Spur gelernt)"
+                                      : (S.wUsed || S.realW).toFixed(2) + " (angenommen)") + "\n" +
     "# tempoquelle=" + (S.speedMode === "gps" ? "GPS" : "von Hand " + S.manSpeed) +
       " wunschtempo=" + S.vSet + " zielluecke=" + S.gapTarget + "\n" +
     "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
