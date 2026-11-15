@@ -1062,8 +1062,19 @@ async function detectLoop(){
         }
         S.dets = list;
         S.win = win;
+        /* Das Band in Bildpunkten ist geometrisch falsch: dieselben 324
+           Punkte sind in 10 m Entfernung 2,3 m seitlich, in 50 m aber
+           11,7 m. Deshalb geriet in der Ortsdurchfahrt ein am Bordstein
+           geparktes Auto ins Band und wurde als Vordermann genommen,
+           waehrend das tatsaechlich vorausfahrende weiter in der Mitte
+           stand. Richtig ist der seitliche Versatz in Metern, und der
+           folgt direkt aus der Boxbreite: X = (cx - Spurmitte) * d / f. */
+        var fB = focalVideo();
         var cand = list.filter(function(b){
-          return Math.abs(b.x + b.w/2 - laneMid(b.y + b.h, vw)) < band;
+          var cx = b.x + b.w/2, mid = laneMid(b.y + b.h, vw);
+          if(Math.abs(cx - mid) > band) return false;          // grobe Vorauswahl
+          var dB = fB * (REALW[b.cls] || S.realW) / Math.max(4, b.w);
+          return Math.abs((cx - mid) * dB / fB) < 3.0;         // in Metern
         });
         lead = pickTarget(cand, vw);
         if(lead) S.lastDayHit = tNow;
