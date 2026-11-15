@@ -249,9 +249,9 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <p>Stell dich in <strong>bekanntem Abstand</strong> hinter ein Fahrzeug — Maßband oder abgeschritten. Trag den Abstand und die echte Breite dieses Fahrzeugs ein, dann zurück und das erkannte Fahrzeug antippen.</p>
     <label for="i-caldist">Bekannter Abstand in m</label>
     <input type="number" id="i-caldist" value="10" min="1" max="100" step="0.1">
-    <label for="i-calwidth">Echte Breite dieses Fahrzeugs in m</label>
-    <input type="number" id="i-calwidth" value="1.772" min="0.5" max="3" step="0.001">
-    <p class="hint">Audi A4 B7: 1,772 m · VW Golf VII: 1,799 m · Transporter: etwa 2,00 m · Lkw: 2,55 m</p>
+    <label for="i-calwidth" id="l-calref">Echte Breite dieses Fahrzeugs in m</label>
+    <input type="number" id="i-calwidth" value="1.772" min="0.3" max="3" step="0.001">
+    <p class="hint" id="h-calref">Audi A4 B7: 1,772 m · VW Golf VII: 1,799 m · Transporter: etwa 2,00 m · Lkw: 2,55 m</p>
     <div class="btns">
       <button class="pri" id="b-calgo">Jetzt messen</button>
       <button id="b-calclose">Abbrechen</button>
@@ -1353,8 +1353,15 @@ function finishCalib(boxPx){
   S.fov = fov;
   document.getElementById("i-fov").value = fov.toFixed(1);
   document.getElementById("l-fov").textContent = fov.toFixed(1) + "°";
+  /* Die eingetragene Bezugsgroesse gleich dort festhalten, wo sie spaeter
+     gebraucht wird - sonst misst die App nach dem Kalibrieren weiter mit
+     dem alten Wert und macht den Gewinn wieder zunichte. */
+  var nacht = S.activeMode === "night";
+  if(nacht){ S.lightSpan = S.calWidth; document.getElementById("i-span").value = S.calWidth; }
+  else { S.realW = S.calWidth; document.getElementById("i-width").value = S.calWidth; }
   document.getElementById("calstatus").innerHTML =
-    "Box " + Math.round(boxPx) + " px bei " + S.calDist + " m<br>" +
+    "Rahmen " + Math.round(boxPx) + " px bei " + S.calDist + " m<br>" +
+    (nacht ? "Rückleuchtenabstand " : "Fahrzeugbreite ") + fmt(S.calWidth,3) + " m<br>" +
     "Brennweite " + Math.round(f) + " px<br><strong>Blickwinkel " + fov.toFixed(1) + "° übernommen</strong>";
   document.getElementById("calib").hidden = false;
   kf.reset();
@@ -1411,6 +1418,20 @@ document.getElementById("b-close").addEventListener("click", function(){
 });
 document.getElementById("b-cal").addEventListener("click", function(){
   document.getElementById("calstatus").textContent = "";
+  /* Entscheidend: im Nachtmodus umspannt der Rahmen NICHT die Karosserie,
+     sondern die beiden Rueckleuchten von Mitte zu Mitte. Wer dort die
+     Fahrzeugbreite eintraegt, kalibriert die Brennweite um ein Drittel
+     daneben - und zwar so gleichmaessig, dass es hinterher plausibel
+     aussieht. Deshalb fragt der Dialog nach dem, was gerade wirklich
+     gemessen wird. */
+  var nacht = S.activeMode === "night";
+  document.getElementById("l-calref").textContent = nacht
+    ? "Abstand der Rückleuchten, Mitte zu Mitte, in m"
+    : "Echte Breite dieses Fahrzeugs in m";
+  document.getElementById("h-calref").innerHTML = nacht
+    ? "<strong>Nachtmodus:</strong> der Rahmen liegt auf den Rückleuchten, nicht auf der Karosserie. Gemessen wird von der Mitte der einen zur Mitte der anderen Leuchte — das sind bei einem Kleinwagen etwa 1,0 bis 1,2 m, bei einem Mittelklassewagen 1,3 bis 1,5 m, also deutlich weniger als die Fahrzeugbreite."
+    : "Audi A4 B7: 1,772 m · VW Golf VII: 1,799 m · Transporter: etwa 2,00 m · Lkw: 2,55 m";
+  document.getElementById("i-calwidth").value = nacht ? S.lightSpan : S.realW;
   document.getElementById("calib").hidden = false;
 });
 document.getElementById("b-calclose").addEventListener("click", function(){
