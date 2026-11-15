@@ -603,6 +603,13 @@ function scanWindow(vw, vh){
       return clampWin(vx, vy + vw*0.05, vw*0.30, vw, vh);
   }
   if(scanIdx === 3) return clampWin(vw/2, vh*0.60, Math.min(vw, vh), vw, vh, true);
+  /* Die mittleren Felder bleiben auf festen Bruchteilen der Bildhoehe.
+     Sie geometrisch auf 20 m und 45 m zu legen lag nahe - sein Handy zielt
+     rund 8 Grad ueber den Horizont, ein Teil der Felder sass also im
+     Himmel. An seinen eigenen achtzig Bildern gemessen bringt es aber
+     nichts: 82 % gegen 85 % gegen 82 % Trefferquote, Median 43 m in allen
+     drei Faellen, und die enge Fassung verlor zehn Meter Reichweite.
+     Nicht belegbar, also nicht eingebaut. */
   return clampWin(vw/2, vh*scanYs[scanIdx], vw*0.55, vw, vh);
 }
 function drawScan(win){
