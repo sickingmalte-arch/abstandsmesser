@@ -312,6 +312,7 @@ var S = {
   fov:69.7, realW:1.80, conf:0.30, boost:true,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
   win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"", minPeriod:0,
+  nachtQuelle:"", nightDbg:null,
   res:"hoch", laneTick:0,
   lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
@@ -851,32 +852,48 @@ function laneDetect(fr){
 function nightDetect(fr){
   if(!fr) return null;
   var W = fr.W, H = fr.H, px = fr.px, n = W*H;
-  var mask = new Uint8Array(n), thr = S.redMin;
+  /* Rueckleuchten sind im Handybild ueberbelichtet: der Kern ist WEISS -
+     an einer echten Aufnahme gemessen 255/255/250 - und nur der Saum ist
+     rot. Eine reine Rotpruefung wirft damit genau den hellsten Teil der
+     Leuchte weg. Deshalb zwei Masken: eindeutig rot und sehr hell. Geflutet
+     wird ueber beide, behalten wird eine Flaeche aber nur, wenn genug
+     eindeutig rote Punkte darin liegen. So bleibt der weisse Kern drin,
+     waehrend Scheinwerfer, Strassenlaternen und helle Schilder herausfallen. */
+  var rot = new Uint8Array(n), msk = new Uint8Array(n), thr = S.redMin;
   for(var i=0, j=0; i<n; i++, j+=4){
     var r=px[j], g2=px[j+1], b=px[j+2];
-    if(r > thr && r > g2*1.5 && r > b*1.5) mask[i] = 1;
+    if(r > thr && r > g2*1.45 && r > b*1.45){ rot[i]=1; msk[i]=1; }
+    else if(r > 235 && g2 > 165 && b > 145) msk[i]=1;
   }
 
-  // Zusammenhaengende rote Flaechen finden
   var seen = new Uint8Array(n), stack = [], blobs = [];
   for(var s0=0; s0<n; s0++){
-    if(!mask[s0] || seen[s0]) continue;
+    if(!msk[s0] || seen[s0]) continue;
     stack.length = 0; stack.push(s0); seen[s0] = 1;
-    var minx=W, maxx=0, miny=H, maxy=0, cnt=0;
+    var minx=W, maxx=0, miny=H, maxy=0, cnt=0, rc=0;
     while(stack.length){
       var k = stack.pop(), kx = k % W, ky = (k / W) | 0;
-      cnt++;
+      cnt++; if(rot[k]) rc++;
       if(kx<minx) minx=kx; if(kx>maxx) maxx=kx;
       if(ky<miny) miny=ky; if(ky>maxy) maxy=ky;
-      if(kx>0   && mask[k-1] && !seen[k-1]){ seen[k-1]=1; stack.push(k-1); }
-      if(kx<W-1 && mask[k+1] && !seen[k+1]){ seen[k+1]=1; stack.push(k+1); }
-      if(ky>0   && mask[k-W] && !seen[k-W]){ seen[k-W]=1; stack.push(k-W); }
-      if(ky<H-1 && mask[k+W] && !seen[k+W]){ seen[k+W]=1; stack.push(k+W); }
+      if(kx>0   && msk[k-1] && !seen[k-1]){ seen[k-1]=1; stack.push(k-1); }
+      if(kx<W-1 && msk[k+1] && !seen[k+1]){ seen[k+1]=1; stack.push(k+1); }
+      if(ky>0   && msk[k-W] && !seen[k-W]){ seen[k-W]=1; stack.push(k-W); }
+      if(ky<H-1 && msk[k+W] && !seen[k+W]){ seen[k+W]=1; stack.push(k+W); }
     }
-    if(cnt >= 3 && cnt < n*0.12){
-      blobs.push({ cx:(minx+maxx)/2, cy:(miny+maxy)/2,
-                   w:maxx-minx+1, h:maxy-miny+1, n:cnt, x:minx, y:miny });
-    }
+    var bw = maxx-minx+1, bh = maxy-miny+1, sei = bh/bw;
+    /* Eine Leuchte ist ungefaehr kompakt, fuellt ihr Rechteck und ist vor
+       allem KLEIN. Selbst dicht dahinter ist eine Rueckleuchte nur gut
+       zwanzig Punkte breit. Ohne diese Schranke hielt die App den von den
+       eigenen Scheinwerfern angestrahlten Asphalt fuer ein Leuchtenpaar -
+       403 Punkte breit, angeblich 4,6 m entfernt. Die langen senkrechten
+       roten Striche, die die Kamera aus hellen Lichtern macht, und das
+       Reflektorband an der Leitplanke fallen ueber die Seitenverhaeltnisse
+       heraus. */
+    if(!(cnt >= 3 && rc >= cnt*0.15 && sei > 0.25 && sei < 3.0 &&
+         cnt > bw*bh*0.30 && bw <= W*0.12 && bh <= H*0.09)) continue;
+    blobs.push({ cx:(minx+maxx)/2, cy:(miny+maxy)/2,
+                 w:bw, h:bh, n:cnt, x:minx, y:miny });
   }
 
   // Paare bilden: gleiche Hoehe, aehnliche Groesse, plausibler Abstand
@@ -891,28 +908,28 @@ function nightDetect(fr){
       var br = Math.max(L.n, R.n) / Math.min(L.n, R.n);
       if(br > 3.2) continue;                                     // aehnlich gross
       var lw = (L.w + R.w) / 2;
-      if(dx < lw * 1.8 || dx > lw * 16) continue;                // plausibles Verhaeltnis
+      if(dx < lw * 2.4 || dx > lw * 13) continue;                // plausibles Verhaeltnis
       if(dx > W * 0.85) continue;
-      pairs.push({ L:L, R:R, dx:dx, cx:(L.cx + R.cx)/2,
+      pairs.push({ L:L, R:R, dx:dx,
                    score: dx - Math.abs((L.cx+R.cx)/2 - mid) * 1.4 });
     }
   }
-  if(!pairs.length) return { all:[], lead:null };
+  S.nightDbg = { blobs: blobs.map(function(x){ return [Math.round(x.x),Math.round(x.y),x.w,x.h,x.n]; }),
+                 paare: pairs.length };
+  if(!pairs.length) return { all:[], cands:[], lead:null };
 
-  var best = pairs.reduce(function(a,b){ return b.score > a.score ? b : a; });
-  var sc = fr.sc;                                                // zurueck auf Videopixel
-  var top = Math.min(best.L.y, best.R.y), bot = Math.max(best.L.y + best.L.h, best.R.y + best.R.h);
-  var lead = {
-    x: best.L.cx * sc, y: top * sc,
-    w: best.dx * sc, h: Math.max(bot - top, 4) * sc,
-    cls: "lights"
-  };
-  var all = [];
-  pairs.forEach(function(p){
-    if(p === best) return;
-    all.push({ x:p.L.cx*sc, y:Math.min(p.L.y,p.R.y)*sc, w:p.dx*sc, h:Math.max(p.L.h,p.R.h)*sc, cls:"lights" });
+  /* ALLE plausiblen Paare zurueckgeben, nicht nur das beste. Vorher bekam
+     die Zielverfolgung je Bild genau einen Vorschlag - wechselte der, sprang
+     das Ziel mit, und von Verfolgen konnte keine Rede sein. */
+  pairs.sort(function(p,q){ return q.score - p.score; });
+  var sc = fr.sc;
+  var kand = pairs.slice(0, 8).map(function(p){
+    var top = Math.min(p.L.y, p.R.y);
+    var bot = Math.max(p.L.y + p.L.h, p.R.y + p.R.h);
+    return { x:p.L.cx*sc, y:top*sc, w:p.dx*sc,
+             h:Math.max(bot - top, 4)*sc, cls:"lights" };
   });
-  return { all:all, lead:lead };
+  return { all:kand.slice(1), cands:kand, lead:kand[0] };
 }
 
 /* --- Zielverfolgung ueber Bilder hinweg ---
@@ -1027,10 +1044,48 @@ async function detectLoop(){
       S.dusk = useNight && dusk && S.lum >= 62;
 
       if(useNight){
-        lead = nres ? nres.lead : null;
-        S.dets = nres ? nres.all : [];
-        S.win = null;
-        lead = pickTarget(lead ? [lead] : [], vw);
+        /* Auch nachts zuerst das Modell fragen. An einer echten Nachtfahrt
+           gemessen findet es das vorausfahrende Auto in zehn von zehn
+           Bildern, mit sauber fallenden Abstaenden von 28 auf 17 m. Die
+           Rueckleuchtensuche bleibt als Rueckfall fuer das, was das Modell
+           nicht mehr sieht - dann ist vom Fahrzeug wirklich nur noch ein
+           Lichterpaar da. Der Kontrastschub bleibt dabei aus: mit ihm fiel
+           die Trefferquote von zehn auf vier von zehn. */
+        var kandN = [];
+        if(S.model){
+          var winN = scanWindow(vw, vh), prN = [], bAlt = S.boost;
+          S.boost = false;
+          try{ prN = await S.model.detect(drawScan(winN), 12); }catch(e){ prN = []; }
+          S.boost = bAlt;
+          var kxN = winN.w/SCAN, kyN = winN.h/SCAN;
+          for(var iN=0; iN<prN.length; iN++){
+            var pN = prN[iN], bbN = pN.bbox;
+            if(!VEHICLES[pN.class] || pN.score < S.conf) continue;
+            var cutN = bbN[0] < 3 || bbN[1] < 3 ||
+                       bbN[0]+bbN[2] > SCAN-3 || bbN[1]+bbN[3] > SCAN-3;
+            if(cutN && bbN[2] < SCAN*0.35) continue;
+            kandN.push({ x:winN.x + bbN[0]*kxN, y:winN.y + bbN[1]*kyN,
+                         w:bbN[2]*kxN, h:bbN[3]*kyN,
+                         cls:pN.class, score:pN.score, cut:cutN });
+          }
+          S.win = winN;
+        }
+        S.nachtQuelle = kandN.length ? "Modell" : "Leuchten";
+        if(!kandN.length){ kandN = nres ? nres.cands : []; S.win = null; }
+        /* Auch nachts gilt: was mehr als drei Meter seitlich steht, faehrt
+           nicht vor mir. Das haelt Leitplankenreflektoren, Begrenzungspfosten
+           und die Lichter der Gegenfahrbahn heraus - gemessen hatte die
+           Rotpruefung ueber 36 000 Punkte quer ueber das ganze Bild. */
+        var fN = focalVideo();
+        kandN = kandN.filter(function(b){
+          var cx = b.x + b.w/2, mid = laneMid(b.y + b.h, vw);
+          var ref = b.cls === "lights" ? S.lightSpan : (REALW[b.cls] || S.realW);
+          var dB = fN * ref / Math.max(3, b.w);
+          return dB > 2 && dB < 160 && Math.abs((cx - mid) * dB / fN) < 3.0;
+        });
+        S.dets = kandN.slice(1);
+        lead = pickTarget(kandN, vw);
+        if(lead && lead.cls !== "lights") S.lastDayHit = tNow;
         /* Im Daemmerungsmodus hin und wieder nachsehen, ob das Modell wieder
            etwas sieht. Ohne das bliebe die App bis zum Ende der Fahrt in der
            Daemmerung haengen, weil der Tagzweig gar nicht mehr aufgerufen
@@ -1304,7 +1359,9 @@ function draw(){
   if(solide && isFinite(ttc) && ttc < 6){ ttcWarn = true; beep(ttc < 3.5); }
   set("d-fps", S.fps ? S.fps.toFixed(0) : "—");
   var modeTxt = S.model || S.activeMode === "night"
-      ? (S.activeMode === "night" ? (S.dusk ? "Dämmerung" : "Nacht") : "Tag") : "Hand";
+      ? (S.activeMode === "night"
+          ? (S.dusk ? "Dämmerung" : "Nacht") + (S.nachtQuelle === "Leuchten" ? "·Leuchten" : "")
+          : "Tag") : "Hand";
   if(S.wGelernt) modeTxt += "·Spur";
   else if(S.hochHeck) modeTxt += "·hohes Heck";
   set("d-mode", modeTxt);
