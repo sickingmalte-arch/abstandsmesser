@@ -1538,6 +1538,7 @@ function finishCalib(boxPx){
     "Brennweite " + Math.round(f) + " px<br><strong>Blickwinkel " + fov.toFixed(1) + "° übernommen</strong>";
   document.getElementById("calib").hidden = false;
   kf.reset();
+  if(typeof merken === "function") merken();
 }
 
 /* ---------------- Handbetrieb: Rechteck ziehen ---------------- */
@@ -1707,6 +1708,59 @@ document.getElementById("i-conf").addEventListener("input", function(){
 });
 document.getElementById("i-speed").addEventListener("change", function(){ S.speedMode = this.value; });
 document.getElementById("i-manspeed").addEventListener("input", function(){ S.manSpeed = +this.value; });
+
+/* ---------------- Einstellungen ueberleben das Neuladen ----------------
+   Chrome wirft auf dem Handy eine Seite im Hintergrund gern weg, und beim
+   naechsten Oeffnen stand bisher alles wieder auf Standard - auch der
+   muehsam kalibrierte Blickwinkel und die einmal mit dem Massband
+   gemessene Kamerahoehe. Gespeichert werden die Bedienfelder selbst,
+   nicht der Zustand dahinter: beim Laden werden sie gesetzt und ihr
+   normales Ereignis ausgeloest, sodass genau dieselben Handler laufen wie
+   bei einer Eingabe von Hand. So gibt es keine zweite Wahrheit, die
+   auseinanderlaufen koennte.
+   Der Speicher kann fehlen oder beim Zugriff werfen - im privaten Fenster,
+   bei gesperrten Seitendaten. Deshalb steht um jeden Zugriff ein Netz, und
+   die App laeuft ohne ihn genauso, nur eben ohne Gedaechtnis. */
+var MERKFELDER = ["i-fov","i-boost","i-takt","i-res","i-width","i-camh",
+                  "i-mode","i-span","i-red","i-vset","i-gaptarget","i-lanes",
+                  "i-lanethr","i-lanew","i-sound","i-warngap","i-vol",
+                  "i-conf","i-speed","i-manspeed"];
+function merken(){
+  try{
+    var o = {};
+    for(var i=0;i<MERKFELDER.length;i++){
+      var el = document.getElementById(MERKFELDER[i]);
+      if(el) o[MERKFELDER[i]] = el.value;
+    }
+    localStorage.setItem("abstandsmesser", JSON.stringify(o));
+  }catch(e){}
+}
+function erinnern(){
+  var o = null;
+  try{ o = JSON.parse(localStorage.getItem("abstandsmesser") || "null"); }catch(e){}
+  if(!o || typeof o !== "object") return 0;
+  var n = 0;
+  for(var i=0;i<MERKFELDER.length;i++){
+    var id = MERKFELDER[i];
+    if(!Object.prototype.hasOwnProperty.call(o, id)) continue;
+    var el = document.getElementById(id);
+    if(!el || typeof o[id] !== "string" || el.value === o[id]) continue;
+    try{
+      el.value = o[id];
+      if(el.value !== o[id]) continue;        // Wert passte nicht ins Feld
+      el.dispatchEvent(new Event(el.tagName === "SELECT" ? "change" : "input",
+                                 { bubbles:true }));
+      n++;
+    }catch(e){}
+  }
+  return n;
+}
+document.getElementById("settings").addEventListener("input", merken);
+document.getElementById("settings").addEventListener("change", merken);
+(function(){
+  var n = erinnern();
+  if(n) status(n + " gespeicherte Einstellungen übernommen.", "");
+})();
 
 document.getElementById("b-rec").addEventListener("click", function(){
   S.rec = !S.rec;
