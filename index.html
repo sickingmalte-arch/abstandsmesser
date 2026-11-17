@@ -168,6 +168,11 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
     <input type="number" id="i-camh" value="1.25" min="0.6" max="2.2" step="0.01">
     <p class="hint">Einmal mit dem Maßband von der Fahrbahn bis zur Linse messen, während das Handy in der Halterung steckt. Damit rechnet die App die <em>echte</em> Breite des Vordermanns aus, auch wo keine Fahrbahnmarkierung liegt — und verlässt sich nicht mehr auf die geratenen 1,80 m. <b id="l-geo">noch nichts gelernt</b></p>
 
+    <p class="hint" id="h-lern">Oder anlernen statt messen: einem Fahrzeug folgen, dessen Breite du kennst, seine Breite hier eintragen — die Kamerahöhe rechnet die App sich dann selbst aus.<br><b id="l-lern">noch keine brauchbare Verfolgung</b></p>
+    <label for="i-lernw">Echte Breite des verfolgten Fahrzeugs in m</label>
+    <input type="number" id="i-lernw" value="1.80" min="1.2" max="3.0" step="0.01">
+    <button id="b-lernhoehe">Kamerahöhe daraus berechnen</button>
+
     <label for="i-red">Empfindlichkeit für Rot <b id="l-red">80</b></label>
     <input type="range" id="i-red" min="40" max="180" step="5" value="80">
 
@@ -212,8 +217,8 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <button id="b-testbeep">Warnton testen</button>
     </div>
 
-    <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.30</b></label>
-    <input type="range" id="i-conf" min="0.15" max="0.8" step="0.05" value="0.30">
+    <label for="i-conf">Erkennungsschwelle <b id="l-conf">0.25</b></label>
+    <input type="range" id="i-conf" min="0.15" max="0.8" step="0.05" value="0.25">
 
     <label for="i-res">Kamerastrom</label>
     <select id="i-res">
@@ -313,7 +318,7 @@ function judge(g){
 
 /* ---------------- Zustand ---------------- */
 var S = {
-  fov:69.7, realW:1.80, conf:0.30, boost:true,
+  fov:69.7, realW:1.80, conf:0.25, boost:true,
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
   win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"", minPeriod:0,
   nachtQuelle:"", nightDbg:null,
@@ -324,6 +329,7 @@ var S = {
   track:null, learnedW:0, learnedN:0, srcLane:false, err:0,
   wUsed:0, wGelernt:false, hochHeck:false,
   camHeight:1.25, yVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
+  bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -1011,6 +1017,17 @@ function geoSammeln(w, yU, cx, vh){
   var rms = Math.sqrt(Math.max(0, (g.syy - b*g.sy - a*g.swy)) / Math.max(1, g.n - 2));
   if(rms > vh*0.006) return;
   S.geoRms = rms;
+  /* Die beste Anpassung der Sitzung festhalten: aus ihrer Steigung laesst
+     sich spaeter im Stand die Kamerahoehe gewinnen, wenn der Fahrer die
+     Breite des verfolgten Fahrzeugs kennt. Eine von Hand bestaetigte
+     Verfolgung schlaegt dabei jede automatische - dort ist sicher, dass
+     die ganze Reihe demselben Auto galt. */
+  var jetztFest = !!(S.track && S.track.fest);
+  var sb = S.slopeBest;
+  if(!sb || (jetztFest && !sb.fest) ||
+     (jetztFest === sb.fest && (g.n > sb.n || (g.n >= sb.n*0.8 && rms < sb.rms))))
+    S.slopeBest = { a:a, n:g.n, rms:rms,
+                    spanne:(g.wMax - g.wMin)/g.wMax, fest:jetztFest };
   S.yVgeo = S.yVgeo === null ? b : S.yVgeo*0.82 + b*0.18;
   S.yVn++;
 }
@@ -1027,10 +1044,16 @@ function laneMid(yVideo, vw){
 }
 
 function pickTarget(cands, vw){
+  /* Ein von Hand bestaetigtes Ziel wird deutlich laenger gehalten und
+     niemals stillschweigend gegen ein anderes Fahrzeug getauscht. Wer
+     hingetippt hat, meint dieses Auto - verliert das Modell es kurz,
+     ist Warten richtig und Weiterspringen falsch. */
+  var fest = S.track && S.track.fest;
+  var grenze = fest ? 25 : 6;
   if(!cands.length){
     if(S.track){
       S.track.misses++;
-      if(S.track.misses > 6){ S.track = null; kf.reset(); S.learnedN = 0; }
+      if(S.track.misses > grenze){ S.track = null; kf.reset(); S.learnedN = 0; }
     }
     return null;
   }
@@ -1043,7 +1066,17 @@ function pickTarget(cands, vw){
       var sc = 1 - (dcx*3.0 + dw*1.2);
       if(sc > bestScore){ bestScore = sc; best = c; }
     });
-    if(bestScore < 0.45) best = null;          // passt nicht mehr zum Ziel
+    if(bestScore < (fest ? 0.25 : 0.45)) best = null;   // passt nicht mehr zum Ziel
+  }
+  if(!best && fest){
+    /* Nichts passt - aber das Ziel ist bestaetigt. Lieber eine Weile gar
+       nichts anzeigen als das falsche Auto messen. */
+    S.track.misses++;
+    if(S.track.misses > grenze){
+      S.track = null; kf.reset(); S.learnedN = 0;
+      status("Bestätigtes Fahrzeug aus den Augen verloren.", "warn");
+    }
+    return null;
   }
   if(!best){
     best = cands.reduce(function(a,b){
@@ -1136,7 +1169,7 @@ async function detectLoop(){
         if(S.model){
           var winN = scanWindow(vw, vh), prN = [], bAlt = S.boost;
           S.boost = false;
-          try{ prN = await S.model.detect(drawScan(winN), 12); }catch(e){ prN = []; }
+          try{ prN = await S.model.detect(drawScan(winN), 12, S.conf); }catch(e){ prN = []; }
           S.boost = bAlt;
           var kxN = winN.w/SCAN, kyN = winN.h/SCAN;
           for(var iN=0; iN<prN.length; iN++){
@@ -1174,13 +1207,13 @@ async function detectLoop(){
         if(dusk && S.model && tNow - S.duskProbe > 6000){
           S.duskProbe = tNow;
           var pw = clampWin(vw/2, vh*0.60, Math.min(vw,vh), vw, vh, true), pr = [];
-          try{ pr = await S.model.detect(drawScan(pw), 8); }catch(e){ pr = []; }
+          try{ pr = await S.model.detect(drawScan(pw), 8, S.conf); }catch(e){ pr = []; }
           for(var z=0; z<pr.length; z++)
             if(VEHICLES[pr[z].class] && pr[z].score >= S.conf){ S.lastDayHit = tNow; break; }
         }
       } else if(S.model){
         var win = scanWindow(vw, vh), preds = [];
-        try{ preds = await S.model.detect(drawScan(win), 12); }catch(e){ preds = []; }
+        try{ preds = await S.model.detect(drawScan(win), 12, S.conf); }catch(e){ preds = []; }
         var kx = win.w/SCAN, ky = win.h/SCAN;
         for(var i=0;i<preds.length;i++){
           var p = preds[i], bb = p.bbox;
@@ -1414,6 +1447,16 @@ function draw(){
     }
     cx.strokeStyle = col; cx.lineWidth = 3;
     cx.strokeRect(X(b.x), Y(b.y), b.w*s, b.h*s);
+    /* Ein von Hand bestaetigtes Ziel bekommt einen zweiten, weiten Ring -
+       auf einen Blick erkennbar, ohne hinsehen zu muessen. */
+    if(S.track && S.track.fest){
+      cx.save();
+      cx.strokeStyle = col; cx.lineWidth = 1.5; cx.setLineDash([7,6]);
+      cx.globalAlpha = 0.75;
+      var r2 = Math.max(6, b.w*s*0.10);
+      cx.strokeRect(X(b.x)-r2, Y(b.y)-r2, b.w*s+2*r2, b.h*s+2*r2);
+      cx.restore();
+    }
     var cl = Math.max(10, b.w*s*0.18);
     cx.lineWidth = 5;
     [[X(b.x),Y(b.y),1,1],[X(b.x)+b.w*s,Y(b.y),-1,1],
@@ -1549,15 +1592,103 @@ function toVideo(clientX, clientY){
   var ox = (r.width - vw*s)/2, oy = (r.height - vh*s)/2;
   return { x:(clientX - r.left - ox)/s, y:(clientY - r.top - oy)/s };
 }
-var mDrag = null;
+var mDrag = null, tipp = null, langTimer = null;
+
+/* --- Antippen: "Das da ist ein Auto" ---
+   Das Modell uebersieht gerade die weit entfernten Fahrzeuge, also genau
+   die, auf die es ankommt. Ein Fingertipp auf den Vordermann sagt der App,
+   wo sie hinsehen soll. Sie sieht dann an dieser Stelle noch einmal
+   gezielt und empfindlicher nach, uebernimmt das Fahrzeug als Ziel und
+   bleibt daran - auch wenn das Modell es zwischendurch verliert.
+   Langer Druck auf das Ziel gibt es wieder frei. */
+async function bestaetige(p){
+  var vw = video.videoWidth || 1, vh = video.videoHeight || 1;
+  function trifft(b, rand){
+    if(!b || !(b.w > 0)) return false;
+    var m = rand * Math.max(b.w, b.h);
+    return p.x > b.x - m && p.x < b.x + b.w + m &&
+           p.y > b.y - m && p.y < b.y + b.h + m;
+  }
+  /* Erst unter dem schauen, was ohnehin schon gefunden wurde. Bei
+     ineinanderliegenden Kaesten ist der kleinste der gemeinte. */
+  var alle = (S.lead ? [S.lead] : []).concat(S.dets || []);
+  var ziel = null, i;
+  for(i = 0; i < alle.length; i++)
+    if(trifft(alle[i], 0.15) && (!ziel || alle[i].w < ziel.w)) ziel = alle[i];
+
+  if(!ziel && S.model && !S.tippLaeuft){
+    S.tippLaeuft = true;
+    /* Nichts gefunden - also gezielt an der Fingerstelle nachsehen, mit
+       deutlich niedrigerer Schwelle als im laufenden Betrieb. Hier ist ein
+       Fehlgriff harmlos: der Mensch hat ja gerade hingezeigt. */
+    var schw = Math.max(0.08, S.conf * 0.4);
+    var win = clampWin(p.x, p.y, Math.max(vw*0.16, Math.min(vw*0.55, vw*0.28)), vw, vh);
+    var pr = [];
+    try{ pr = await S.model.detect(drawScan(win), 12, schw); }catch(e){ pr = []; }
+    S.tippLaeuft = false;
+    var kx = win.w/SCAN, ky = win.h/SCAN, nah = 1e9;
+    for(i = 0; i < pr.length; i++){
+      var q = pr[i], bb = q.bbox;
+      if(!VEHICLES[q.class] || q.score < schw) continue;
+      var kand = { x:win.x + bb[0]*kx, y:win.y + bb[1]*ky,
+                   w:bb[2]*kx, h:bb[3]*ky,
+                   cls:q.class, score:q.score, cut:false };
+      var dx = kand.x + kand.w/2 - p.x, dy = kand.y + kand.h/2 - p.y;
+      var d = Math.sqrt(dx*dx + dy*dy);
+      if(d < nah){ nah = d; ziel = kand; }
+    }
+  }
+  if(!ziel){
+    status("Dort war kein Fahrzeug zu erkennen.", "warn");
+    return;
+  }
+  var neuesZiel = !S.track ||
+    Math.abs((ziel.x + ziel.w/2) - (S.track.x + S.track.w/2)) > ziel.w*0.6 ||
+    Math.abs(ziel.w - S.track.w) > ziel.w*0.4;
+  S.track = { x:ziel.x, y:ziel.y, w:ziel.w, h:ziel.h,
+              misses:0, age:0, fest:true };
+  if(neuesZiel){
+    kf.reset();
+    S.learnedW = 0; S.learnedN = 0;
+    S.geoW = 0; S.geoN = 0; geoReset();
+  }
+  S.festSeit = performance.now();
+  S.bestaetigt = (S.bestaetigt || 0) + 1;
+  status("Fahrzeug übernommen — ich bleibe dran. Langer Druck gibt es frei.", "");
+}
+function loslassen(){
+  if(!S.track || !S.track.fest) return false;
+  S.track.fest = false;
+  S.track = null; kf.reset();
+  status("Ziel freigegeben.", "");
+  return true;
+}
+
 function mStart(e){
-  if(S.model) return;                       // bei aktiver Erkennung nicht noetig
-  e.preventDefault();
+  /* Immer abfangen: sonst erzeugt der Browser nach touchend noch ein
+     synthetisches mousedown/mouseup, und der Tipp wuerde doppelt
+     ausgewertet - einmal als Beruehrung, einmal als Mausklick. */
+  if(e.cancelable) e.preventDefault();
   var t = e.touches ? e.touches[0] : e;
-  mDrag = toVideo(t.clientX, t.clientY);
-  S.manual = null;
+  var p = toVideo(t.clientX, t.clientY);
+  tipp = { p:p, t:performance.now(), weit:false };
+  if(!S.model){ mDrag = p; S.manual = null; }
+  if(langTimer) clearTimeout(langTimer);
+  langTimer = setTimeout(function(){
+    langTimer = null;
+    if(tipp && !tipp.weit && loslassen()) tipp = null;
+  }, 650);
 }
 function mMove(e){
+  if(tipp && !tipp.weit){
+    var tt = e.touches ? e.touches[0] : e;
+    var q = toVideo(tt.clientX, tt.clientY);
+    var dx = q.x - tipp.p.x, dy = q.y - tipp.p.y;
+    if(Math.sqrt(dx*dx + dy*dy) > (video.videoWidth || 400)*0.03){
+      tipp.weit = true;
+      if(langTimer){ clearTimeout(langTimer); langTimer = null; }
+    }
+  }
   if(!mDrag) return;
   e.preventDefault();
   var t = e.touches ? e.touches[0] : e;
@@ -1566,13 +1697,17 @@ function mMove(e){
                w:Math.abs(p.x-mDrag.x), h:Math.abs(p.y-mDrag.y), cls:"manuell" };
 }
 function mEnd(){
+  if(langTimer){ clearTimeout(langTimer); langTimer = null; }
+  var war = tipp; tipp = null;
   mDrag = null;
   if(S.manual && S.manual.w > 4){
     var f = focalVideo();
     if(S.calibrating){ finishCalib(S.manual.w); S.manual = null; return; }
     S.manual.dist = distFromBox(S.manual.w, S.realW, f);
     S.lead = S.manual;
+    return;
   }
+  if(war && !war.weit && S.model) bestaetige(war.p);
 }
 cv.addEventListener("mousedown", mStart);
 window.addEventListener("mousemove", mMove);
@@ -1586,6 +1721,7 @@ document.getElementById("b-start").addEventListener("click", start);
 document.getElementById("b-set").addEventListener("click", function(){
   document.getElementById("settings").hidden = false;
   showOptik();
+  zeigeLern();
 });
 document.getElementById("b-close").addEventListener("click", function(){
   document.getElementById("settings").hidden = true;
@@ -1724,7 +1860,7 @@ document.getElementById("i-manspeed").addEventListener("input", function(){ S.ma
 var MERKFELDER = ["i-fov","i-boost","i-takt","i-res","i-width","i-camh",
                   "i-mode","i-span","i-red","i-vset","i-gaptarget","i-lanes",
                   "i-lanethr","i-lanew","i-sound","i-warngap","i-vol",
-                  "i-conf","i-speed","i-manspeed"];
+                  "i-conf","i-speed","i-manspeed","i-lernw"];
 function merken(){
   try{
     var o = {};
@@ -1755,6 +1891,44 @@ function erinnern(){
   }
   return n;
 }
+/* --- Kamerahoehe anlernen statt messen ---
+   Die Gerade yU = yV + (h/W)*w hat die Steigung h/W. Kennt man die Breite
+   des verfolgten Fahrzeugs, folgt daraus die Kamerahoehe - ohne Massband.
+   Das ist dieselbe Rechnung wie das Breitenlernen, nur andersherum. */
+function zeigeLern(){
+  var el = document.getElementById("l-lern");
+  if(!el) return;
+  var sb = S.slopeBest;
+  if(!sb){ el.textContent = "noch keine brauchbare Verfolgung"; return; }
+  var W = +document.getElementById("i-lernw").value;
+  var h = sb.a * (W > 1.2 && W < 3.0 ? W : 1.80);
+  el.textContent = "Steigung " + sb.a.toFixed(3) + " aus " + sb.n +
+    " Punkten (" + Math.round(sb.spanne*100) + " % Größenänderung, " +
+    fmt(sb.rms,1) + " px Streuung" + (sb.fest ? ", bestätigtes Ziel" : "") +
+    ") → Kamerahöhe " + fmt(h,2) + " m";
+}
+document.getElementById("i-lernw").addEventListener("input", zeigeLern);
+document.getElementById("b-lernhoehe").addEventListener("click", function(){
+  var sb = S.slopeBest;
+  if(!sb){ status("Noch keine brauchbare Verfolgung — einem Fahrzeug folgen, bis sich der Abstand deutlich ändert.", "warn"); return; }
+  var W = +document.getElementById("i-lernw").value;
+  if(!(W > 1.2 && W < 3.0)){ status("Breite zwischen 1,2 und 3,0 m eintragen.", "warn"); return; }
+  var h = sb.a * W;
+  /* In einem Pkw sitzt ein Handy zwischen gut 0,8 m (tiefes Armaturenbrett)
+     und knapp 1,6 m (oben an der Scheibe eines hohen Wagens). Alles weit
+     daneben heisst: entweder stimmt die eingetragene Breite nicht, oder die
+     Verfolgung galt nicht durchgehend demselben Fahrzeug. */
+  if(!(h > 0.70 && h < 1.80)){
+    status("Daraus käme " + fmt(h,2) + " m Kamerahöhe — so hoch oder tief sitzt kein Handy im Auto. Stimmt die eingetragene Breite?", "warn");
+    return;
+  }
+  var el = document.getElementById("i-camh");
+  el.value = h.toFixed(2);
+  el.dispatchEvent(new Event("input", { bubbles:true }));   // setzt S und speichert
+  zeigeLern();
+  status("Kamerahöhe " + fmt(h,2) + " m übernommen und gespeichert.", "");
+});
+
 document.getElementById("settings").addEventListener("input", merken);
 document.getElementById("settings").addEventListener("change", merken);
 (function(){
