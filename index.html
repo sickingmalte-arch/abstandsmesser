@@ -178,7 +178,8 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <option value="1">ja — runde Schilder im Blick behalten</option>
       <option value="0">nein — spart Rechenzeit</option>
     </select>
-    <p class="hint">Liest deutsche Zeichen 274. An gemalten Schildern gemessen: ab 32 Punkten Durchmesser scharf fehlerfrei, mit Unschärfe und Rauschen ab 64 — das sind rund <b>15 Meter</b> Abstand. Weiter entfernte Schilder sind im Bild zu klein. Bei Tempo 50 bleiben dafür zwei bis drei Bilder, auf der Landstraße oft keines. Gezeigt wird deshalb immer, <em>wann</em> das Limit zuletzt gesehen wurde — es kann längst aufgehoben sein.</p>
+    <p class="hint">Liest deutsche Zeichen 274 (rundes Tempolimit) sowie Ortstafel und Ortsausgang. Gemessen an gerechneten Vorbeifahrten: das runde Schild wird zwischen <b>35 und 9 m</b> gelesen, die Ortstafel ab <b>38 m</b> — sie ist größer. Die Ortstafel setzt 50, der Ortsausgang hebt auf. Weiter entfernte Schilder sind im Bild zu klein; bei Tempo 50 bleiben für ein rundes Schild rund sieben Suchen, bei Tempo 100 noch dreieinhalb, und zwei davon müssen übereinstimmen.</p>
+    <p class="hint"><strong>Was sie nicht sieht:</strong> das Aufhebungszeichen 282, Einmündungen, Zusatzschilder („bei Nässe", „7,5 t"), Autobahnende. Gezeigt wird deshalb immer, <em>wie weit</em> es seit dem Schild her ist, und nach drei Kilometern gar nichts mehr. Verlass dich nicht darauf.</p>
 
     <label for="i-red">Empfindlichkeit für Rot <b id="l-red">80</b></label>
     <input type="range" id="i-red" min="40" max="180" step="5" value="80">
@@ -338,7 +339,7 @@ var S = {
   camHeight:1.25, yVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
   bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
-  schildBox:null,
+  schildBox:null, laneMiss:0, ortsKand:0, ortsEnde:0, ortsBuchstaben:0,
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -1144,11 +1145,25 @@ async function detectLoop(){
       var list = [], lead = null, nres = null;
 
       // Ein Bild holen, das sich Nachtmodus und Spurerkennung teilen
-      var fr = (S.mode !== "day" || S.lanes) ? grabFrame() : null;
+      /* Das Bild wird nur geholt, wenn es jemand braucht: der Nachtmodus
+         immer, die Spursuche nur in den Durchgaengen, in denen sie auch
+         laeuft. Im gedrosselten Zustand faellt das Holen damit in sieben
+         von acht Durchgaengen weg. */
+      var laneJetzt = S.lanes &&
+        (S.laneTick + 1) % (S.laneMiss > 20 ? 8 : 2) === 0;
+      var fr = (S.mode !== "day" || laneJetzt) ? grabFrame() : null;
       /* Die Spur muss nicht in jedem Durchlauf neu gesucht werden: sie
          aendert sich langsam, und jede Suche kostet Rechenzeit und damit
          Waerme. Das Bewegungsprofil wird trotzdem in jedem Durchlauf
          fortgeschrieben, sonst verliert es seinen Takt. */
+      /* Die Spursuche lief bisher stur in jedem zweiten Durchgang. An
+         einer Ortsdurchfahrt wie seiner findet sie dabei in NULL von
+         dreissig Bildern etwas - gemessen - und kostet trotzdem jedes
+         Mal 2,5 ms, dazu das Bildholen mit 2,9 ms. Also drosselt sie
+         sich selbst: nach zwanzig vergeblichen Versuchen nur noch jeder
+         achte Durchgang. Findet sie wieder etwas, ist sie sofort zurueck
+         im vollen Takt - eine Landstrasse mit Markierung verliert also
+         nichts. */
       S.laneTick++;
       /* Schilder in JEDEM Durchgang suchen. Zuerst stand hier jeder
          dritte, aus Sorge um die Waerme - aber eine Suche kostet gemessen
@@ -1161,7 +1176,10 @@ async function detectLoop(){
         try{ schilderLesen(vw, vh); }catch(e){ S.schildFehler = e.message; }
       }
       if(!S.lanes) S.lane = null;
-      else if(fr && S.laneTick % 2 === 0) S.lane = laneDetect(fr);
+      else if(fr && S.laneTick % (S.laneMiss > 20 ? 8 : 2) === 0){
+        S.lane = laneDetect(fr);
+        if(S.lane) S.laneMiss = 0; else if(S.laneMiss < 999) S.laneMiss++;
+      }
       if(fr && (S.mode === "night" || (S.mode === "auto" && S.lum < 115)))
         nres = nightDetect(fr);
       /* In der Daemmerung ist es fuer das Modell schon zu dunkel, fuer eine
@@ -1512,12 +1530,21 @@ function draw(){
   if(S.schildBox && performance.now() - S.schildBox.t < 900){
     var sb = S.schildBox;
     var kx = X(sb.x + sb.w/2), ky = Y(sb.y + sb.h/2);
-    var kr = Math.max(14, Math.max(sb.w, sb.h)*s*0.78);
     cx.save();
     cx.strokeStyle = "#E4322B"; cx.lineWidth = 3;
-    cx.beginPath(); cx.arc(kx, ky, kr, 0, Math.PI*2); cx.stroke();
-    cx.strokeStyle = "rgba(228,50,43,.45)"; cx.lineWidth = 1.5;
-    cx.beginPath(); cx.arc(kx, ky, kr + 5, 0, Math.PI*2); cx.stroke();
+    if(sb.orts){
+      /* Eine Ortstafel ist ein Rechteck - also auch rechteckig umranden,
+         sonst sieht es aus, als haette die App etwas anderes gefunden. */
+      var rw = sb.w*s*0.62, rh = sb.h*s*0.95;
+      cx.strokeRect(kx - rw, ky - rh, rw*2, rh*2);
+      cx.strokeStyle = "rgba(228,50,43,.45)"; cx.lineWidth = 1.5;
+      cx.strokeRect(kx - rw - 5, ky - rh - 5, rw*2 + 10, rh*2 + 10);
+    } else {
+      var kr = Math.max(14, Math.max(sb.w, sb.h)*s*0.78);
+      cx.beginPath(); cx.arc(kx, ky, kr, 0, Math.PI*2); cx.stroke();
+      cx.strokeStyle = "rgba(228,50,43,.45)"; cx.lineWidth = 1.5;
+      cx.beginPath(); cx.arc(kx, ky, kr + 5, 0, Math.PI*2); cx.stroke();
+    }
     cx.restore();
   }
 
@@ -1547,8 +1574,10 @@ function draw(){
     cx.font = "500 11px 'IBM Plex Mono', monospace";
     cx.fillStyle = "rgba(226,232,235,.92)";
     cx.shadowColor = "#000"; cx.shadowBlur = 4;
-    cx.fillText(weg2 < 950 ? "vor " + Math.round(weg2/50)*50 + " m"
-                           : "vor " + fmt(weg2/1000,1) + " km", ux, uy + rr + 14);
+    var wegTxt2 = weg2 < 950 ? "vor " + Math.round(weg2/50)*50 + " m"
+                             : "vor " + fmt(weg2/1000,1) + " km";
+    cx.fillText(S.limit.quelle === "Ortstafel" ? "Ort · " + wegTxt2 : wegTxt2,
+                ux, uy + rr + 14);
     cx.textAlign = "left"; cx.textBaseline = "alphabetic";
     cx.restore();
   }
@@ -1959,7 +1988,7 @@ function schildBand(vw, vh){
   var yV = S.yVgeo !== null ? S.yVgeo
          : (S.lane && isFinite(S.lane.yV) ? S.lane.yV * S.lane.sc : vh*0.50);
   var y0 = Math.max(0, Math.round(yV - vh*0.15));
-  var y1 = Math.min(vh, Math.round(yV + vh*0.04));
+  var y1 = Math.min(vh, Math.round(yV + vh*0.09));
   if(y1 - y0 < 30) return null;
   var x0 = Math.round(vw*0.22);
   return { x:x0, y:y0, w:vw - x0, h:y1 - y0 };
@@ -1995,8 +2024,9 @@ function roteFlecken(img, W, H, redMin){
        Zahlen gibt und eine davon zufaellig passt. Genau so entstanden im
        Test aus einer 130 eine 30 und aus einer 100 eine 110. Ab 30
        Punkten las der Leser an gemalten Schildern fehlerfrei; darunter
-       wird lieber gar nichts gemeldet. */
-    if(bw < 30 || bh < 30) continue;
+       wird lieber gar nichts gemeldet. Gesucht wird in halber Aufloesung,
+       die Schwelle steht deshalb bei 15. */
+    if(bw < 15 || bh < 15) continue;        // halbe Aufloesung: 15 heisst 30 im Bild
     if(Math.abs(bw-bh) > 0.40*Math.max(bw,bh)) continue;
     if(z < bw*bh*0.10) continue;
     /* Am Rand angeschnittene Schilder zeigen nur noch einen Teil der
@@ -2008,26 +2038,177 @@ function roteFlecken(img, W, H, redMin){
   return raus;
 }
 
+/* --- Ortstafel und Ortsausgang ---
+   Das Limit wusste bisher nicht, wann es endet. Die staerkste Antwort
+   darauf ist nicht das Aufhebungszeichen - das ist weiss auf oft weissem
+   Himmel und schwer zu finden - sondern die Ortstafel: gross, gesaettigt
+   gelb, und semantisch eindeutig. Zeichen 310 heisst in Deutschland
+   50 km/h, Zeichen 311 beendet das wieder. Den Ortsnamen muss dafuer
+   niemand lesen; es genuegt, das gelbe Rechteck zu finden und zu pruefen,
+   ob der Name durchgestrichen ist - der Strich ist rot. */
+function gelbeFlecken(img, W, H){
+  var d = img.data, n = W*H, ist = new Uint8Array(n), i;
+  for(i=0;i<n;i++){
+    var R = d[i*4], Gc = d[i*4+1], B = d[i*4+2];
+    /* Ortstafelgelb ist RAL 1012, also kraeftig und deutlich blauarm.
+       Herbstlaub kommt farblich nah heran - das faengt spaeter die
+       Formpruefung ab, nicht die Farbe. */
+    if(R > 120 && R - B > 70 && Gc - B > 45 && Gc > R*0.62 && Gc < R*1.12) ist[i] = 1;
+  }
+  var marke = new Int32Array(n), m = 0, raus = [], stapel = [];
+  for(var s2=0;s2<n;s2++){
+    if(!ist[s2] || marke[s2]) continue;
+    m++; stapel.length = 0; stapel.push(s2); marke[s2] = m;
+    var minx=W, maxx=-1, miny=H, maxy=-1, z=0;
+    while(stapel.length){
+      var p = stapel.pop(), x = p%W, y = (p/W)|0;
+      z++;
+      if(x<minx)minx=x; if(x>maxx)maxx=x;
+      if(y<miny)miny=y; if(y>maxy)maxy=y;
+      if(x>0   && ist[p-1] && !marke[p-1]){ marke[p-1]=m; stapel.push(p-1); }
+      if(x<W-1 && ist[p+1] && !marke[p+1]){ marke[p+1]=m; stapel.push(p+1); }
+      if(y>0   && ist[p-W] && !marke[p-W]){ marke[p-W]=m; stapel.push(p-W); }
+      if(y<H-1 && ist[p+W] && !marke[p+W]){ marke[p+W]=m; stapel.push(p+W); }
+    }
+    var bw = maxx-minx+1, bh = maxy-miny+1;
+    if(bw < 22 || bh < 9) continue;                 // halbe Aufloesung
+    var verh = bw/bh;
+    if(verh < 1.5 || verh > 6.0) continue;          // breit, kein Rhombus
+    /* Ein Schild ist eine volle Flaeche. Laub, Rapsfeld und
+       Warnbaken fuellen ihren Kasten nie so dicht aus. */
+    if(z < bw*bh*0.72) continue;
+    if(minx <= 1 || miny <= 1 || maxx >= W-2 || maxy >= H-2) continue;
+    raus.push({ x:minx, y:miny, w:bw, h:bh, dicht:z/(bw*bh) });
+    if(raus.length >= 3) break;
+  }
+  return raus;
+}
+
+/* Steht auf der gelben Flaeche ein ORTSNAME - oder etwas anderes?
+   Im Test wurde ein Umleitungsschild als Ortstafel gelesen: beide sind
+   gelbe Rechtecke mit schwarzem Inhalt, Seitenverhaeltnis und
+   Fuellgrad trennen sie nicht. Was sie trennt, ist die Gestalt des
+   Inhalts. Ein Ortsname besteht aus vielen getrennten Buchstaben, ein
+   Pfeil aus einem einzigen Stueck. Also wird aus dem Videobild in
+   voller Aufloesung ausgeschnitten und gezaehlt, wie viele getrennte
+   dunkle Flaechen nebeneinander stehen. */
+function sindBuchstaben(vx, vy, vw2, vh2){
+  var G = 96;
+  var ch = Math.max(16, Math.round(G * vh2 / Math.max(1, vw2)));
+  kandCv.width = G; kandCv.height = ch;
+  kandQ.drawImage(video, vx, vy, vw2, vh2, 0, 0, G, ch);
+  var d = kandQ.getImageData(0, 0, G, ch).data, n = G*ch, i;
+  var g = new Float32Array(n), summe = 0;
+  for(i=0;i<n;i++){ g[i] = d[i*4]*0.30 + d[i*4+1]*0.59 + d[i*4+2]*0.11; summe += g[i]; }
+  var mittel = summe/n, thr = mittel * 0.62;      // deutlich dunkler als das Gelb
+  var ist = new Uint8Array(n), dunkel = 0;
+  for(i=0;i<n;i++) if(g[i] < thr){ ist[i] = 1; dunkel++; }
+  if(dunkel < n*0.02 || dunkel > n*0.55) return { n:0, anteil:dunkel/n };
+  var marke = new Int32Array(n), m = 0, teile = [], stapel = [];
+  for(var s3=0;s3<n;s3++){
+    if(!ist[s3] || marke[s3]) continue;
+    m++; stapel.length = 0; stapel.push(s3); marke[s3] = m;
+    var minx=G, maxx=-1, miny=ch, maxy=-1, z=0;
+    while(stapel.length){
+      var p = stapel.pop(), x = p%G, y = (p/G)|0;
+      z++;
+      if(x<minx)minx=x; if(x>maxx)maxx=x;
+      if(y<miny)miny=y; if(y>maxy)maxy=y;
+      if(x>0    && ist[p-1] && !marke[p-1]){ marke[p-1]=m; stapel.push(p-1); }
+      if(x<G-1  && ist[p+1] && !marke[p+1]){ marke[p+1]=m; stapel.push(p+1); }
+      if(y>0    && ist[p-G] && !marke[p-G]){ marke[p-G]=m; stapel.push(p-G); }
+      if(y<ch-1 && ist[p+G] && !marke[p+G]){ marke[p+G]=m; stapel.push(p+G); }
+    }
+    var bw = maxx-minx+1, bh = maxy-miny+1;
+    /* Ein Buchstabe ist schmaler als hoch oder hoechstens etwa quadratisch
+       und nimmt nur einen kleinen Teil der Breite ein. Ein Pfeil zieht
+       sich ueber das halbe Schild. */
+    if(bh < ch*0.18 || bh > ch*0.92) continue;
+    if(bw > G*0.28) continue;
+    teile.push(minx);
+  }
+  return { n:teile.length, anteil:dunkel/n };
+}
+
+/* Durchgestrichen? Zeichen 311 traegt einen roten Balken ueber dem
+   Namen. Gesucht wird kraeftiges Rot INNERHALB der gelben Flaeche. */
+function durchgestrichen(img, W, f){
+  var d = img.data, rot = 0, ges = 0;
+  for(var y=f.y; y<f.y+f.h; y++) for(var x=f.x; x<f.x+f.w; x++){
+    var i = (y*W+x)*4, R = d[i], Gc = d[i+1], B = d[i+2];
+    ges++;
+    if(R > 95 && R - Gc > 55 && R - B > 45) rot++;
+  }
+  return ges ? rot/ges : 0;
+}
+
 /* Ein Durchgang: Band holen, rote Flecken suchen, jeden lesen lassen.
    Erst wenn derselbe Wert zweimal hintereinander herauskommt, gilt er -
    ein falsches Limit ist schlimmer als gar keines. */
-var schildWarte = null;
+var schildWarte = null, ortsWarte = null;
 function schilderLesen(vw, vh){
   var band = schildBand(vw, vh);
   if(!band) return;
-  schildCv.width = band.w; schildCv.height = band.h;
-  schildQ.drawImage(video, band.x, band.y, band.w, band.h, 0, 0, band.w, band.h);
-  var img = schildQ.getImageData(0, 0, band.w, band.h);
-  var flecken = roteFlecken(img, band.w, band.h, S.redMin*0.5);
+  /* Das Suchen der roten Flecken geschieht in HALBER Aufloesung. Gemessen
+     kostete der ganze Durchgang vorher 6,2 ms, und das meiste davon ging
+     fuer das Abtasten jedes einzelnen Bildpunktes im Band drauf. Bei
+     halber Kantenlaenge ist das ein Viertel der Arbeit, und ein Schild
+     von mindestens 30 Punkten ist dort immer noch 15 Punkte gross -
+     eindeutig genug, um es zu FINDEN. GELESEN wird danach aus dem
+     Videobild in voller Aufloesung, daran aendert sich nichts. */
+  var hw = Math.max(8, Math.round(band.w/2)), hh = Math.max(8, Math.round(band.h/2));
+  schildCv.width = hw; schildCv.height = hh;
+  schildQ.drawImage(video, band.x, band.y, band.w, band.h, 0, 0, hw, hh);
+  var img = schildQ.getImageData(0, 0, hw, hh);
+  var flecken = roteFlecken(img, hw, hh, S.redMin*0.5);
   S.schildKand = flecken.length;
+
+  /* Dieselben Bildpunkte, zweite Frage: steht da eine Ortstafel? Kostet
+     nur einen weiteren Durchlauf ueber das ohnehin geholte Band. */
+  var gelb = gelbeFlecken(img, hw, hh);
+  S.ortsKand = gelb.length;
+  for(var gi=0; gi<gelb.length; gi++){
+    var og = gelb[gi];
+    var anteilRot = durchgestrichen(img, hw, og);
+    var raus = anteilRot > 0.035;                  // Name durchgestrichen
+    var bu = sindBuchstaben(band.x + og.x*2, band.y + og.y*2, og.w*2, og.h*2);
+    S.ortsBuchstaben = bu.n;
+    /* Buchstaben werden nur beim ORTSEINGANG verlangt. Beim Ausgang
+       verbindet der rote Balken die Buchstaben zu einem Stueck - und er
+       ist fuer sich schon Kennzeichen genug: ein gelbes Rechteck mit
+       rotem Querbalken ist in Deutschland nichts anderes als Zeichen 311. */
+    if(!raus && bu.n < 3) continue;
+    var jetzt = performance.now();
+    if(ortsWarte && ortsWarte.raus === raus && jetzt - ortsWarte.t < 4000){
+      if(raus){
+        S.limit = null;
+        S.ortsEnde = jetzt;
+        status("Ortsausgang — Limit aufgehoben.", "");
+      } else {
+        S.limit = { wert:50, t:jetzt, odo:S.odo, r:0, quelle:"Ortstafel" };
+        status("Ortstafel — innerorts 50.", "");
+      }
+      S.schildBox = { x:band.x + og.x*2, y:band.y + og.y*2,
+                      w:og.w*2, h:og.h*2, wert:raus ? 0 : 50, t:jetzt, orts:true };
+      ortsWarte = null;
+    } else {
+      ortsWarte = { raus:raus, t:jetzt };
+      S.schildBox = { x:band.x + og.x*2, y:band.y + og.y*2,
+                      w:og.w*2, h:og.h*2, wert:raus ? 0 : 50, t:jetzt, orts:true };
+    }
+    break;
+  }
+  if(ortsWarte && performance.now() - ortsWarte.t > 4000) ortsWarte = null;
   for(var i=0;i<flecken.length;i++){
-    var f = flecken[i];
+    var fh = flecken[i];
+    // zurueck in Videokoordinaten
+    var f = { x:fh.x*2, y:fh.y*2, w:fh.w*2, h:fh.h*2 };
     var rand = Math.round(Math.max(f.w, f.h) * 0.30);
     var gr = Math.max(f.w, f.h) + 2*rand;
     kandCv.width = kandCv.height = gr;
     kandQ.fillStyle = "#808080"; kandQ.fillRect(0, 0, gr, gr);
-    kandQ.drawImage(schildCv,
-      f.x + f.w/2 - gr/2, f.y + f.h/2 - gr/2, gr, gr, 0, 0, gr, gr);
+    kandQ.drawImage(video,
+      band.x + f.x + f.w/2 - gr/2, band.y + f.y + f.h/2 - gr/2, gr, gr, 0, 0, gr, gr);
     var e = LESER.lies(kandCv, S.redMin*0.5);
     if(!e.ok) continue;
     /* Fundstelle in Bildkoordinaten merken, damit die Anzeige das Schild
