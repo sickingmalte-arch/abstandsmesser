@@ -102,7 +102,6 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <div class="cell"><div class="k">Genauigkeit</div><div class="v" id="d-err">—</div></div>
       <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
       <div class="cell"><div class="k">Modus</div><div class="v" id="d-mode" style="font-size:.95rem">—</div></div>
-      <div class="cell"><div class="k">Limit zuletzt</div><div class="v" id="d-limit" style="font-size:.95rem">—</div></div>
     </div>
     <div id="verdict"></div>
   </div>
@@ -339,6 +338,7 @@ var S = {
   camHeight:1.25, yVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
   bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
+  schildBox:null,
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
   dets:[], lead:null, lastDetT:0, fps:0,
@@ -1417,6 +1417,10 @@ function draw(){
   }
   S.odoT = tJetzt;
 
+  /* Verfallen wird vor dem Zeichnen geprueft, nicht danach: sonst steht
+     das Schild noch ein Bild lang da, nachdem es schon ungueltig ist. */
+  if(S.limit && S.odo - S.limit.odo > 3000) S.limit = null;
+
   var gap = (S.lead && S.lead.dist) ? S.lead.dist/ownSpeed() : NaN;
   var j = judge(gap);
   var col = j.c === "crit" ? "#FF4D4D" : (j.c === "warn" ? "#F5C542" : "#35D07F");
@@ -1504,6 +1508,51 @@ function draw(){
     }
   }
 
+  /* --- Das erkannte Schild: rot umkreist, wo es steht --- */
+  if(S.schildBox && performance.now() - S.schildBox.t < 900){
+    var sb = S.schildBox;
+    var kx = X(sb.x + sb.w/2), ky = Y(sb.y + sb.h/2);
+    var kr = Math.max(14, Math.max(sb.w, sb.h)*s*0.78);
+    cx.save();
+    cx.strokeStyle = "#E4322B"; cx.lineWidth = 3;
+    cx.beginPath(); cx.arc(kx, ky, kr, 0, Math.PI*2); cx.stroke();
+    cx.strokeStyle = "rgba(228,50,43,.45)"; cx.lineWidth = 1.5;
+    cx.beginPath(); cx.arc(kx, ky, kr + 5, 0, Math.PI*2); cx.stroke();
+    cx.restore();
+  }
+
+  /* --- Und als Schild unten rechts, wie im Armaturenbrett ---
+     Gemalt wie das echte Zeichen 274: weisse Scheibe, roter Ring,
+     schwarze Zahl. Darunter die seither gefahrene Strecke, denn das
+     Limit ist das zuletzt GESEHENE, nicht das sicher geltende. */
+  if(S.limit){
+    var rr = Math.min(40, Math.max(26, cv.width*0.085));
+    var ux = cv.width - rr - 18;
+    var uy = cv.height - rr - 96;
+    var vEig = ownSpeed()*3.6;
+    var zuViel = vEig > S.limit.wert + Math.max(3, S.limit.wert*0.05);
+    cx.save();
+    cx.shadowColor = "rgba(0,0,0,.65)"; cx.shadowBlur = 10;
+    cx.beginPath(); cx.arc(ux, uy, rr, 0, Math.PI*2);
+    cx.fillStyle = "#F4F2EE"; cx.fill();
+    cx.shadowBlur = 0;
+    cx.lineWidth = rr*0.26; cx.strokeStyle = zuViel ? "#FF2A20" : "#C1121F";
+    cx.beginPath(); cx.arc(ux, uy, rr - rr*0.13, 0, Math.PI*2); cx.stroke();
+    var txt = String(S.limit.wert);
+    cx.fillStyle = "#15161A"; cx.textAlign = "center"; cx.textBaseline = "middle";
+    cx.font = "700 " + (rr * (txt.length >= 3 ? 0.80 : 0.95)) + "px " +
+              "'IBM Plex Sans','Arial Narrow',Arial,sans-serif";
+    cx.fillText(txt, ux, uy + rr*0.03);
+    var weg2 = S.odo - S.limit.odo;
+    cx.font = "500 11px 'IBM Plex Mono', monospace";
+    cx.fillStyle = "rgba(226,232,235,.92)";
+    cx.shadowColor = "#000"; cx.shadowBlur = 4;
+    cx.fillText(weg2 < 950 ? "vor " + Math.round(weg2/50)*50 + " m"
+                           : "vor " + fmt(weg2/1000,1) + " km", ux, uy + rr + 14);
+    cx.textAlign = "left"; cx.textBaseline = "alphabetic";
+    cx.restore();
+  }
+
   // Anzeigen
   var vo = ownSpeed(), dv = S.lead && S.lead.vRel !== undefined ? S.lead.vRel*3.6 : NaN;
   /* So genau anzeigen, wie gemessen wurde - nicht genauer.
@@ -1561,16 +1610,7 @@ function draw(){
      Ortstafeln, keine Einmuendungen. Deshalb steht immer dabei, wie weit
      es her ist - und ab drei Kilometern wird es ganz ausgeblendet, weil
      es dann bedeutungslos geworden ist. */
-  var lim = S.limit;
-  if(lim && S.odo - lim.odo > 3000){ S.limit = null; lim = null; }
-  if(lim){
-    var weg = S.odo - lim.odo;
-    var wegTxt = weg < 950 ? Math.round(weg/50)*50 + " m" : fmt(weg/1000, 1) + " km";
-    var zuSchnell = vo*3.6 > lim.wert + Math.max(3, lim.wert*0.05);
-    set("d-limit", lim.wert + " · " + wegTxt, zuSchnell ? "crit" : "");
-  } else {
-    set("d-limit", "—", "");
-  }
+
   /* Empfehlung wie bei einem Abstandsregeltempomaten:
      Die Geschwindigkeit des Vordermanns, korrigiert um die Abstandsabweichung,
      begrenzt auf die selbst gesetzte Wunschgeschwindigkeit. */
@@ -1990,6 +2030,10 @@ function schilderLesen(vw, vh){
       f.x + f.w/2 - gr/2, f.y + f.h/2 - gr/2, gr, gr, 0, 0, gr, gr);
     var e = LESER.lies(kandCv, S.redMin*0.5);
     if(!e.ok) continue;
+    /* Fundstelle in Bildkoordinaten merken, damit die Anzeige das Schild
+       dort einkreisen kann, wo es wirklich steht. */
+    S.schildBox = { x:band.x + f.x, y:band.y + f.y, w:f.w, h:f.h,
+                    wert:e.wert, t:performance.now() };
     if(schildWarte && schildWarte.wert === e.wert){
       S.limit = { wert:e.wert, t:performance.now(), odo:S.odo, r:Math.round(e.r) };
       schildWarte = null;
