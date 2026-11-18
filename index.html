@@ -341,6 +341,7 @@ var S = {
   bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
   schildBox:null, laneMiss:0, ortsKand:0, ortsEnde:0, ortsBuchstaben:0,
+  bilder:[], bildT:0, recT:0,
   laneZeig:null, laneZeigT:0, spurLage:0.5,
   schildDbg:{roteFlecken:0, groessterFleck:0, gesehen:0, verworfen:0, grund:"", gelesen:0, groesste:0, gruende:{}},
   schildLog:[],
@@ -515,7 +516,7 @@ function ownSpeed(){
    aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
    Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
    Aufzeichnung. */
-var VERSION = "18.11.2026 · 19:40";
+var VERSION = "18.11.2026 · 20:05";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -1221,6 +1222,26 @@ async function detectLoop(){
          Dafuer ist das Lesefenster viel zu kurz: zwischen 25 und 10 m
          Abstand liegen bei Tempo 50 nur etwa vier Bilder, und zwei davon
          muessen denselben Wert ergeben. */
+      /* --- Rohe Kamerabilder mitschneiden ---
+         Alles, was bisher zur Fehlersuche da war, waren Bildschirmfotos.
+         Darin steckt das Kamerabild aber nur noch als Ausschnitt: die
+         Anzeige legt es per object-fit cover in den Schirm, und was
+         dabei seitlich wegfaellt, laesst sich hinterher nicht mehr
+         rekonstruieren. Geometrie - Fluchtpunkt, Fahrbahnbreite,
+         Kamerahoehe - laesst sich daran nicht pruefen. Waehrend einer
+         Aufzeichnung wird deshalb alle vier Sekunden ein ROHES Bild
+         gesichert, genau so, wie die Erkennung es sieht. */
+      if(S.rec && tNow - S.bildT > 4000 && vw){
+        S.bildT = tNow;
+        try{
+          var rc = document.createElement("canvas");
+          rc.width = vw; rc.height = vh;
+          rc.getContext("2d").drawImage(video, 0, 0);
+          S.bilder.push({ t:Math.round((tNow - S.recT)/100)/10,
+                          d:rc.toDataURL("image/jpeg", 0.82) });
+          if(S.bilder.length > 8) S.bilder.shift();
+        }catch(e){}
+      }
       S.schildTick++;
       if(S.schilder && vw){
         try{ schilderLesen(vw, vh); }catch(e){ S.schildFehler = e.message; }
@@ -2802,6 +2823,7 @@ document.getElementById("settings").addEventListener("change", merken);
 document.getElementById("b-rec").addEventListener("click", function(){
   S.rec = !S.rec;
   if(S.rec){
+    S.bilder = []; S.bildT = 0; S.recT = performance.now();
     S.schildLog = [];
     S.schildDbg = { roteFlecken:0, groessterFleck:0, gesehen:0,
                     verworfen:0, grund:"", gelesen:0, groesste:0, gruende:{} };
@@ -2896,8 +2918,20 @@ document.getElementById("b-csv").addEventListener("click", function(){
   a.href = url; a.download = "fahrt.csv";
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+  /* Die rohen Kamerabilder gleich mit sichern - sie sind fuer die
+     Fehlersuche mehr wert als die Zahlen. */
+  var nB = 0;
+  S.bilder.forEach(function(b2, i2){
+    try{
+      var a2 = document.createElement("a");
+      a2.href = b2.d; a2.download = "kamera_" + String(i2+1).padStart(2,"0") + "_" + b2.t + "s.jpg";
+      document.body.appendChild(a2); a2.click(); a2.remove();
+      nB++;
+    }catch(e){}
+  });
   document.getElementById("recinfo").textContent =
-    S.log.length + " Messpunkte als fahrt.csv im Downloadordner.";
+    S.log.length + " Messpunkte als fahrt.csv" +
+    (nB ? " und " + nB + " rohe Kamerabilder" : "") + " im Downloadordner.";
   zeigeBilanz();
 });
 
