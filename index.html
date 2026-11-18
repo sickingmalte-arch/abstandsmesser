@@ -341,6 +341,7 @@ var S = {
   bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
   schildBox:null, laneMiss:0, ortsKand:0, ortsEnde:0, ortsBuchstaben:0,
+  laneZeig:null, laneZeigT:0, spurLage:0.5,
   schildDbg:{roteFlecken:0, groessterFleck:0, gesehen:0, verworfen:0, grund:"", gelesen:0, groesste:0},
   schildLog:[],
   speedMode:"gps", manSpeed:100,
@@ -1446,9 +1447,39 @@ function draw(){
   var j = judge(gap);
   var col = j.c === "crit" ? "#FF4D4D" : (j.c === "warn" ? "#F5C542" : "#35D07F");
 
-  // Fahrspur gruen hinterlegen
-  if(S.lane){
-    var lane = S.lane, k = lane.sc;
+  /* --- Fahrspur ---
+     Zwei Aenderungen auf seinen Wunsch. Erstens bleibt die Spur stehen:
+     bisher verschwand das Gruen, sobald die Suche ein einziges Bild lang
+     nichts fand, und das flackerte. Eine Fahrbahn aendert sich langsam,
+     also wird die zuletzt gefundene weitergezeichnet und verblasst nur,
+     wenn sie wirklich alt wird.
+     Zweitens zeigt die Farbe, wo in der Spur man faehrt: mittig gruen,
+     zum Rand hin gelb und schliesslich rot. Gemessen wird die Lage der
+     KAMERA zwischen den beiden Markierungen - sitzt die Halterung nicht
+     mittig im Wagen, ist auch die Anzeige um diesen Betrag verschoben. */
+  if(S.lane){ S.laneZeig = S.lane; S.laneZeigT = tJetzt; }
+  var laneAlter = S.laneZeig ? tJetzt - S.laneZeigT : 1e9;
+  if(laneAlter > 2500) S.laneZeig = null;
+  if(S.laneZeig){
+    var lane = S.laneZeig, k = lane.sc;
+    /* Wo steht die Kamera zwischen den Markierungen? 0,5 ist die Mitte. */
+    var uRef = Math.min(lane.L.y1, lane.R.y1);
+    var xlU = lane.L.a*uRef + lane.L.b, xrU = lane.R.a*uRef + lane.R.b;
+    var frac = (lane.W/2 - xlU) / Math.max(1e-6, xrU - xlU);
+    var abw = Math.min(1, Math.abs(frac - 0.5) * 2.6);
+    S.spurLage = frac;
+    /* Gruen -> Gelb -> Rot, und mit dem Alter verblassend. */
+    var misch = function(t){
+      var A = [53,208,127], B = [245,197,66], C = [255,77,77], f1, aa, bb;
+      if(t < 0.5){ f1 = t/0.5; aa = A; bb = B; } else { f1 = (t-0.5)/0.5; aa = B; bb = C; }
+      return [Math.round(aa[0]+(bb[0]-aa[0])*f1),
+              Math.round(aa[1]+(bb[1]-aa[1])*f1),
+              Math.round(aa[2]+(bb[2]-aa[2])*f1)];
+    };
+    var rgb = misch(abw);
+    var frisch = Math.max(0.35, 1 - laneAlter/2500);
+    var spurFarbe = "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + frisch.toFixed(2) + ")";
+    var spurFuell = "rgba(" + rgb[0] + "," + rgb[1] + "," + rgb[2] + "," + (0.13*frisch).toFixed(3) + ")";
     var pt = function(f, yy){ return { x:X((f.a*yy + f.b)*k), y:Y(yy*k) }; };
     /* Jede Linie nur so weit zeichnen, wie die Markierung tatsaechlich
        gefunden wurde, und nie oberhalb des Fluchtpunkts. Sonst laeuft das
@@ -1459,11 +1490,11 @@ function draw(){
     var o = Math.max(lo, ro), u = Math.min(lu, ru);
     if(u > o){
       var l0=pt(lane.L,u), l1=pt(lane.L,o), r0=pt(lane.R,u), r1=pt(lane.R,o);
-      cx.fillStyle = "rgba(53,208,127,.13)";
+      cx.fillStyle = spurFuell;
       cx.beginPath(); cx.moveTo(l0.x,l0.y); cx.lineTo(l1.x,l1.y);
       cx.lineTo(r1.x,r1.y); cx.lineTo(r0.x,r0.y); cx.closePath(); cx.fill();
     }
-    cx.strokeStyle = "#35D07F"; cx.lineWidth = 5; cx.lineCap = "round";
+    cx.strokeStyle = spurFarbe; cx.lineWidth = 5; cx.lineCap = "round";
     [[lane.L, lo, lu], [lane.R, ro, ru]].forEach(function(e){
       if(!e[0] || !(e[2] > e[1])) return;
       var a0 = pt(e[0], e[2]), a1 = pt(e[0], e[1]);
@@ -1843,13 +1874,43 @@ var LESER = (function(){
     var br = maxx-minx+1, ho = maxy-miny+1;
     if(br < 8 || ho < 8) return null;
     if(Math.abs(br-ho) > 0.35*Math.max(br,ho)) return null;
+    /* Wie viel der Kreisflaeche ist rot? Ein gemaltes Schild kommt auf
+       gut ein Drittel. An seinem echten Foto bei truebem Licht sind es
+       nur 0,12 - die Rot-Erkennung erwischt vom duennen, matten Ring
+       etwa ein Drittel. Mit der alten Untergrenze von 0,18 fiel genau
+       das 70er durch, das er fotografiert hat. Die Grenze ist deshalb
+       weit unten; was dadurch mehr durchkommt, faellt beim Lesen der
+       Ziffern durch - das ist der zuverlaessige Teil. */
     var fuellung = n / (Math.PI*br*ho/4);
-    if(fuellung < 0.18 || fuellung > 0.72) return null;
-    return { cx:(minx+maxx)/2, cy:(miny+maxy)/2, r:(br+ho)/4, n:n, fuellung:fuellung };
+    if(fuellung < 0.07 || fuellung > 0.80) return null;
+    var mx = (minx+maxx)/2, my = (miny+maxy)/2, rr = (br+ho)/4;
+    /* Ein Zeichen 274 ist ein RING: aussen rot, innen weiss. Die lockere
+       Farbschwelle, ohne die sein echtes Schild bei truebem Licht nicht
+       gefunden wurde, liess sonst auch eine rote Backsteinwand hinter
+       einem vorbeifahrenden Auto als Schild durchgehen - an seinen
+       eigenen Bildern passiert. Also wird ausdruecklich geprueft, dass
+       die MITTE hell und nicht rot ist. Eine Wand faellt damit weg, ein
+       Schild nicht. */
+    var ri2 = rr*0.45, zRot = 0, zGes = 0, zHell = 0;
+    for(y = Math.max(0, Math.round(my-ri2)); y <= Math.min(H-1, Math.round(my+ri2)); y++)
+      for(x = Math.max(0, Math.round(mx-ri2)); x <= Math.min(W-1, Math.round(mx+ri2)); x++){
+        var dx2 = x-mx, dy2 = y-my;
+        if(dx2*dx2 + dy2*dy2 > ri2*ri2) continue;
+        i = (y*W+x)*4;
+        var R2 = d[i], G2 = d[i+1], B2 = d[i+2];
+        zGes++;
+        if(R2 > 70 && R2-G2 > redMin && R2-B2 > redMin*0.75) zRot++;
+        if(R2*0.3 + G2*0.59 + B2*0.11 > 90) zHell++;
+      }
+    if(!zGes) return null;
+    if(zRot/zGes > 0.22) return null;        // Mitte zu rot: keine Scheibe
+    if(zHell/zGes < 0.45) return null;       // Mitte zu dunkel: kein weisses Feld
+    return { cx:mx, cy:my, r:rr, n:n, fuellung:fuellung,
+             mitteRot:zRot/zGes, mitteHell:zHell/zGes };
   }
 
   /* Welche Zahlen stehen ueberhaupt auf deutschen Zeichen 274 */
-  var ERLAUBT = {5:1,10:1,20:1,30:1,40:1,50:1,60:1,70:1,80:1,90:1,
+  var ERLAUBT = {10:1,20:1,30:1,40:1,50:1,60:1,70:1,80:1,90:1,
                  100:1,110:1,120:1,130:1};
 
   function lies(cv, redMin){
@@ -1968,7 +2029,12 @@ var LESER = (function(){
        einzelne Ziffer. */
     var wert = null, zahl = ziffern.join("");
     if(anzahl === 1){
-      if(ziffern[0] === 5) wert = 5;                  // einstellig gibt es nur als 5
+      /* Ein einstelliges Zeichen 274 gibt es in Deutschland praktisch
+         nicht - 5 km/h steht allenfalls auf Privatgelaende. Auf seinem
+         Schirm stand dafuer eine falsch gelesene 5. Der Zweig faellt
+         ersatzlos weg: ein verpasstes Schild ist harmlos, ein falsches
+         Limit nicht. */
+      wert = null;
     } else if(anzahl === 2){
       if(ziffern[0] >= 1 && ziffern[0] <= 9) wert = ziffern[0]*10;
     } else {
@@ -2058,13 +2124,35 @@ function roteFlecken(img, W, H, redMin){
       if(bw*2 > S.schildDbg.groessterFleck) S.schildDbg.groessterFleck = bw*2;
     }
     if(bw < 15 || bh < 15) continue;        // halbe Aufloesung: 15 heisst 30 im Bild
-    if(Math.abs(bw-bh) > 0.40*Math.max(bw,bh)) continue;
-    if(z < bw*bh*0.10) continue;
-    /* Am Rand angeschnittene Schilder zeigen nur noch einen Teil der
-       Zahl - aus 50 wurde so eine 5. */
     if(minx <= 1 || miny <= 1 || maxx >= W-2 || maxy >= H-2) continue;
-    raus.push({ x:minx, y:miny, w:bw, h:bh });
-    if(raus.length >= 4) break;
+
+    /* An einem Mast haengen oft mehrere runde rote Schilder uebereinander.
+       An seinem Bild nachgemessen: ein 70er mit einem Ueberholverbot
+       darunter ergibt EINEN zusammenhaengenden roten Fleck von 73 mal 151
+       Punkten. Der scheiterte am Rundheitstest, und die Anzeige meldete
+       "kein Ring" - genau das stand bei seiner Fahrt auf dem Schirm.
+       Statt auf eine saubere Luecke zwischen den Schildern zu hoffen, die
+       es nicht immer gibt, werden aus einem hohen Klumpen quadratische
+       Fenster geschnitten. Jedes wird einzeln geprueft; was kein Schild
+       ist, faellt beim Lesen durch. */
+    var stuecke;
+    if(bh > bw*1.3){
+      stuecke = [];
+      var anz = Math.min(3, Math.max(2, Math.round(bh/bw)));
+      for(var k=0;k<anz;k++){
+        var oy = Math.round(miny + k*(bh - bw)/(anz - 1));
+        stuecke.push({ x:minx, y:oy, w:bw, h:bw, geteilt:true });
+      }
+    } else {
+      if(Math.abs(bw-bh) > 0.40*Math.max(bw,bh)) continue;
+      if(z < bw*bh*0.10) continue;
+      stuecke = [{ x:minx, y:miny, w:bw, h:bh, geteilt:false }];
+    }
+    for(var si=0; si<stuecke.length; si++){
+      raus.push(stuecke[si]);
+      if(raus.length >= 6) break;
+    }
+    if(raus.length >= 6) break;
   }
   return raus;
 }
@@ -2191,7 +2279,20 @@ function schilderLesen(vw, vh){
   schildCv.width = hw; schildCv.height = hh;
   schildQ.drawImage(video, band.x, band.y, band.w, band.h, 0, 0, hw, hh);
   var img = schildQ.getImageData(0, 0, hw, hh);
-  var flecken = roteFlecken(img, hw, hh, S.redMin*0.5);
+  /* Die Vorsuche braucht eine LOCKERERE Rotschwelle als das Lesen. An
+     seinem Foto nachgemessen: der rote Ring eines 73 Punkte grossen
+     Schildes hat im Band 1029 rote Punkte, nach dem Halbieren nur noch
+     228 - und die zerfallen in Fetzen unterhalb der Mindestgroesse, weil
+     das Verkleinern den duennen Ring mit Weiss und Hintergrund verruehrt
+     und damit entsaettigt. Mit der lockereren Schwelle sind es 1005.
+     Ein zu grosszuegiger Kandidat kostet nichts: gelesen wird danach aus
+     dem Videobild in voller Aufloesung, und dort entscheidet sich, ob es
+     wirklich ein Schild ist. */
+  var flecken = roteFlecken(img, hw, hh, S.redMin*0.28);
+  /* Die groessten zuerst - sie sind am ehesten lesbar - und hoechstens
+     drei je Durchgang, damit die Bildrate nicht leidet. */
+  flecken.sort(function(a,b){ return b.w - a.w; });
+  if(flecken.length > 3) flecken.length = 3;
   S.schildKand = flecken.length;
 
   /* Dieselben Bildpunkte, zweite Frage: steht da eine Ortstafel? Kostet
@@ -2234,13 +2335,18 @@ function schilderLesen(vw, vh){
     var fh = flecken[i];
     // zurueck in Videokoordinaten
     var f = { x:fh.x*2, y:fh.y*2, w:fh.w*2, h:fh.h*2 };
-    var rand = Math.round(Math.max(f.w, f.h) * 0.30);
+    var rand = Math.round(Math.max(f.w, f.h) * (fh.geteilt ? 0.10 : 0.30));
     var gr = Math.max(f.w, f.h) + 2*rand;
     kandCv.width = kandCv.height = gr;
     kandQ.fillStyle = "#808080"; kandQ.fillRect(0, 0, gr, gr);
     kandQ.drawImage(video,
       band.x + f.x + f.w/2 - gr/2, band.y + f.y + f.h/2 - gr/2, gr, gr, 0, 0, gr, gr);
-    var e = LESER.lies(kandCv, S.redMin*0.5);
+    /* Auch der Leser bekommt die lockere Schwelle. An seinem Foto
+       gemessen: dasselbe 70er liest er bei 20 als "70", bei 40 als
+       "keine Ziffern" - weil der Ring dort so duenn erkannt wird, dass
+       das Innenfeld falsch ausgeschnitten wird. Die Sicherheit kommt
+       nicht aus der Farbschwelle, sondern aus den Ziffern. */
+    var e = LESER.lies(kandCv, S.redMin*0.25);
     S.schildDbg.gesehen++;
     if(f.w > S.schildDbg.groesste) S.schildDbg.groesste = Math.round(f.w);
     if(!e.ok){
@@ -2257,7 +2363,14 @@ function schilderLesen(vw, vh){
        dort einkreisen kann, wo es wirklich steht. */
     S.schildBox = { x:band.x + f.x, y:band.y + f.y, w:f.w, h:f.h,
                     wert:e.wert, t:performance.now() };
-    if(schildWarte && schildWarte.wert === e.wert){
+    /* Zwei uebereinstimmende Lesungen sind die Regel. Bei zwei Bildern
+       je Sekunde und 78 km/h fallen aber nur gut zwei Suchen ins
+       Lesefenster - dann kommt die Bestaetigung nie zustande, und genau
+       das stand bei seiner Fahrt auf dem Schirm. Ist das Schild gross im
+       Bild UND die Ziffernerkennung eindeutig, genuegt deshalb eine
+       einzige Lesung. Klein oder knapp: weiterhin zwei. */
+    var sicherGenug = f.w >= 45 && e.sicher !== undefined && e.sicher > 0.45;
+    if(sicherGenug || (schildWarte && schildWarte.wert === e.wert)){
       S.limit = { wert:e.wert, t:performance.now(), odo:S.odo, r:Math.round(e.r) };
       schildWarte = null;
       status("Tempolimit " + e.wert + " erkannt.", "");
