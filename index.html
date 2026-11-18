@@ -331,7 +331,7 @@ var S = {
   mode:"auto", activeMode:"day", lightSpan:1.35, redMin:80, lum:255,
   win:null, dusk:false, lastDayHit:0, duskProbe:0, backend:"", minPeriod:0,
   nachtQuelle:"", nightDbg:null,
-  res:"hoch", laneTick:0,
+  res:"hoch", laneTick:0, lineTol:2.2,
   lanes:true, laneThr:22, lane:null, laneW:3.5,
   vSet:100, gapTarget:2.0,
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
@@ -515,7 +515,7 @@ function ownSpeed(){
    aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
    Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
    Aufzeichnung. */
-var VERSION = "18.11.2026 · 15:10";
+var VERSION = "18.11.2026 · 19:40";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -712,7 +712,13 @@ function dichteSpanne(inl, schritt){
 }
 
 function findLines(pts, ySpanMin, maxLines, schritt){
-  var out = [], pool = pts, TOL = 2.2;
+  /* Wie weit darf ein Punkt von der Geraden abweichen und noch dazu
+     zaehlen? Bei 2,2 Punkten auf 320 Bildbreite passte keine echte
+     Landstrasse mehr: sie macht fast immer eine leichte Kurve, und ueber
+     siebzig Bildzeilen weicht eine gekruemmte Markierung weiter ab als
+     das. An seinem Bild gemessen wurde die rechte Randlinie deshalb nie
+     als Linie erkannt. */
+  var out = [], pool = pts, TOL = S.lineTol || 2.2;   // laneDetect setzt sie
   for(var round=0; round<(maxLines||2) && pool.length>=10; round++){
     var step = Math.max(1, Math.floor(pool.length/20)), seeds = [];
     for(var s=0; s<pool.length; s+=step) seeds.push(pool[s]);
@@ -811,6 +817,13 @@ function laneDetect(fr){
      bei steil gerichteter Kamera ist dessen obere Haelfte Himmel, und eine
      Markierung kann dort gar nicht so lang sein. Kurze helle Flecken haelt
      ohnehin die Dichtepruefung ab. */
+  /* Die Toleranz blieb bei 2,2 Punkten. Acht Punkte - zur Bildbreite
+     passend - lieferten an seinem Bild zwar ein Paar mit plausibler
+     Steigung und plausibler Kamerahoehe, aber direkt ins Videobild
+     gezeichnet lag die rechte Linie mitten in den Baeumen und der
+     Fluchtpunkt im Himmel. Ein selbstbewusst falsches Ergebnis ist
+     schlechter als gar keines, also zurueck. */
+  S.lineTol = 2.2;
   var need = Math.max(24, Math.round(H * 0.06));
   /* Nur Linien zaehlen, deren Belegung bis in den unteren Teil des Bildes
      reicht. Die Markierungen der eigenen Spur laufen bis dicht ans Auto
@@ -869,6 +882,33 @@ function laneDetect(fr){
     var mY = (oY + uY)/2, xl = L.a*mY + L.b, xr = R.a*mY + R.b;
     var frac = (W/2 - xl) / Math.max(1e-6, xr - xl);
     if(!(frac > 0.15 && frac < 0.85)){ grund = "Kamera läge außerhalb der Spur"; return null; }
+    /* Zwischen zwei Fahrbahnmarkierungen liegt ASPHALT. Das klingt
+       selbstverstaendlich und war trotzdem nicht geprueft - an seinem Bild
+       einer Landstrasse mit Leitplanke wurde deshalb ein Paar angenommen,
+       dessen rechte "Markierung" mitten in den Baeumen lag und dessen
+       Fluchtpunkt im Himmel stand. Asphalt ist grau: wenig Farbe,
+       mittlere Helligkeit. Baumkronen, Himmel und Wiese sind das nicht. */
+    var grau = 0, probe = 0, pz, px2;
+    for(pz = 0; pz < 7; pz++){
+      var yp = uY - (uY - oY) * pz / 9;
+      var xlp = L.a*yp + L.b, xrp = R.a*yp + R.b;
+      if(xrp - xlp < 6) continue;
+      for(px2 = 1; px2 <= 5; px2++){
+        var ix = Math.round(xlp + (xrp - xlp) * px2 / 6), iy = Math.round(yp);
+        if(ix < 0 || ix >= W || iy < 0 || iy >= H) continue;
+        var o4 = (iy*W + ix)*4;
+        var Rr = fr.px[o4], Gg = fr.px[o4+1], Bb = fr.px[o4+2];
+        var hell = (Rr + Gg + Bb)/3;
+        var bunt = Math.max(Rr, Gg, Bb) - Math.min(Rr, Gg, Bb);
+        probe++;
+        if(bunt < 46 && hell > 28 && hell < 215) grau++;
+      }
+    }
+    if(probe >= 10 && grau/probe < 0.62){
+      grund = "dazwischen liegt kein Asphalt (" + Math.round(100*grau/probe) + " % grau)";
+      return null;
+    }
+
     var den = L.a - R.a;
     if(Math.abs(den) < 1e-6) return null;
     var yV = (R.b - L.b)/den, xV = L.a*yV + L.b;         // Fluchtpunkt
