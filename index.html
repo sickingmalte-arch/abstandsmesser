@@ -103,6 +103,7 @@ kbd{font-family:var(--mono);background:var(--panel2);border:1px solid var(--line
       <div class="cell"><div class="k">Bild/s</div><div class="v" id="d-fps">—</div></div>
       <div class="cell"><div class="k">Modus</div><div class="v" id="d-mode" style="font-size:.95rem">—</div></div>
       <div class="cell"><div class="k">Schildsuche</div><div class="v" id="d-schild" style="font-size:.8rem">—</div></div>
+      <div class="cell"><div class="k">Spursuche</div><div class="v" id="d-spur" style="font-size:.8rem">—</div></div>
     </div>
     <div id="verdict"></div>
   </div>
@@ -516,7 +517,7 @@ function ownSpeed(){
    aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
    Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
    Aufzeichnung. */
-var VERSION = "18.11.2026 · 20:05";
+var VERSION = "18.11.2026 · 20:35";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -1736,6 +1737,18 @@ function draw(){
   set("d-mode", modeTxt);
   /* Damit eine Fahrt zeigt, WO es klemmt: am Finden, am Lesen oder an
      der Bestaetigung. */
+  /* Warum zeichnet die App keine Spur? Ohne diese Zeile ist das von
+     aussen nicht zu sehen - es fehlen einfach die gruenen Linien, und
+     der Grund steht nirgends. */
+  if(!S.lanes) set("d-spur", "aus", "");
+  else if(S.laneZeig) set("d-spur", "erkannt · " + fmt(S.spurLage*100, 0) + " %", "");
+  else {
+    var ld = S.laneDbg;
+    var txt = ld && ld.grund ? ld.grund : "sucht";
+    if(ld && ld.linien) txt = ld.linien.join("/") + " · " + txt;
+    set("d-spur", txt.slice(0, 32), "");
+  }
+
   var sd = S.schildDbg;
   if(!S.schilder) set("d-schild", "aus", "");
   else if(!sd.roteFlecken) set("d-schild", "nichts Rotes", "");
@@ -2871,6 +2884,12 @@ function csvText(){
     " groesster_kandidat_px=" + d.groesste + "\n" +
     "# suchband=" + (S.yVgeo !== null ? "am gelernten Fluchtpunkt " + Math.round(S.yVgeo)
                                       : "grosszuegig, Fluchtpunkt unbekannt") + "\n" +
+    "# spursuche=" + (S.laneDbg
+        ? ((S.laneDbg.linien ? S.laneDbg.linien.join("/") + " Linien, " : "") +
+           (S.laneDbg.grund || "Spur erkannt") +
+           (S.laneDbg.band ? ", Band " + S.laneDbg.band.join("-") : ""))
+        : "nichts gemessen") +
+      " · Fahrbahnband aus " + (rowMove ? "Bewegung" : "Vorgabe") + "\n" +
     "zeit_s,fleck_px,ergebnis,grund\n" +
     S.schildLog.map(function(r){ return r.join(","); }).join("\n");
   return daten;
