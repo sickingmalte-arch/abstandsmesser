@@ -342,7 +342,7 @@ var S = {
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
   schildBox:null, laneMiss:0, ortsKand:0, ortsEnde:0, ortsBuchstaben:0,
   laneZeig:null, laneZeigT:0, spurLage:0.5,
-  schildDbg:{roteFlecken:0, groessterFleck:0, gesehen:0, verworfen:0, grund:"", gelesen:0, groesste:0},
+  schildDbg:{roteFlecken:0, groessterFleck:0, gesehen:0, verworfen:0, grund:"", gelesen:0, groesste:0, gruende:{}},
   schildLog:[],
   speedMode:"gps", manSpeed:100,
   vOwn:null, vOwnT:0, model:null, running:false,
@@ -510,6 +510,12 @@ function ownSpeed(){
 }
 
 /* ---------------- Erkennung ---------------- */
+/* Sichtbare Fassungskennung. Ohne sie laesst sich nicht unterscheiden,
+   ob eine Aenderung nicht wirkt oder ob der Browser noch die alte Seite
+   aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
+   Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
+   Aufzeichnung. */
+var VERSION = "18.11.2026 · 15:10";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -1670,11 +1676,19 @@ function draw(){
   /* Damit eine Fahrt zeigt, WO es klemmt: am Finden, am Lesen oder an
      der Bestaetigung. */
   var sd = S.schildDbg;
-  set("d-schild", !S.schilder ? "aus"
-      : (sd.roteFlecken ? sd.roteFlecken + "·" + sd.groessterFleck + "px"
-                          + (sd.grund ? "·" + sd.grund.slice(0, 18) : "")
-                          + (sd.gelesen ? "·" + sd.gelesen : "")
-                        : "nichts Rotes"), "");
+  if(!S.schilder) set("d-schild", "aus", "");
+  else if(!sd.roteFlecken) set("d-schild", "nichts Rotes", "");
+  else {
+    /* Eine Strichliste sagt mehr als der letzte Grund: sie zeigt auf
+       einen Blick, ob es am Finden, am Ring oder an den Ziffern liegt. */
+    var kurz = { "kein":"Ring", "zu":"klein", "keine":"Ziffern",
+                 "Ziffern":"verschmolzen", "Innenfeld":"Feld" };
+    var teile = [sd.groessterFleck + "px"];
+    for(var gg in (sd.gruende || {}))
+      if(sd.gruende[gg] > 0) teile.push((kurz[gg] || gg) + " " + sd.gruende[gg]);
+    if(sd.gesehen - sd.verworfen > 0) teile.push("ok " + (sd.gesehen - sd.verworfen));
+    set("d-schild", teile.join("·"), "");
+  }
 
   /* Das zuletzt gelesene Tempolimit. Bewusst NICHT als "hier gilt 50"
      dargestellt: die App sieht nur Schilder, keine Aufhebungen, keine
@@ -2350,6 +2364,9 @@ function schilderLesen(vw, vh){
     S.schildDbg.gesehen++;
     if(f.w > S.schildDbg.groesste) S.schildDbg.groesste = Math.round(f.w);
     if(!e.ok){
+      var gk = (e.grund || "?").split(" ")[0];
+      if(!S.schildDbg.gruende) S.schildDbg.gruende = {};
+      S.schildDbg.gruende[gk] = (S.schildDbg.gruende[gk] || 0) + 1;
       S.schildDbg.grund = e.grund || "?";
       S.schildDbg.verworfen++;
       if(S.rec) S.schildLog.push([(performance.now()/1000).toFixed(1),
@@ -2579,7 +2596,8 @@ function showOptik(){
   el.innerHTML = "Bild " + vw + "×" + vh + " px · " +
     (vh > vw ? "hochkant" : "quer") + " · Brennweite " + Math.round(f) + " px<br>" +
     "quer über das Bild sind das " + quer.toFixed(1) + "°" +
-    (S.backend ? " · Rechenwerk " + S.backend : "") + breite;
+    (S.backend ? " · Rechenwerk " + S.backend : "") +
+    "<br>Fassung " + VERSION + breite;
 }
 document.getElementById("i-fov").addEventListener("input", function(){
   S.fov = +this.value;
@@ -2736,7 +2754,9 @@ document.getElementById("settings").addEventListener("input", merken);
 document.getElementById("settings").addEventListener("change", merken);
 (function(){
   var n = erinnern();
-  if(n) status(n + " gespeicherte Einstellungen übernommen.", "");
+  /* Die Fassung steht beim Start da, damit auf einen Blick klar ist,
+     welche Seite der Browser gerade zeigt. */
+  status("Fassung " + VERSION + (n ? " · " + n + " Einstellungen übernommen" : ""), "");
 })();
 
 document.getElementById("b-rec").addEventListener("click", function(){
@@ -2744,7 +2764,7 @@ document.getElementById("b-rec").addEventListener("click", function(){
   if(S.rec){
     S.schildLog = [];
     S.schildDbg = { roteFlecken:0, groessterFleck:0, gesehen:0,
-                    verworfen:0, grund:"", gelesen:0, groesste:0 };
+                    verworfen:0, grund:"", gelesen:0, groesste:0, gruende:{} };
   }
   this.textContent = S.rec ? "Aufzeichnung läuft" : "Aufzeichnen";
   this.className = S.rec ? "pri" : "";
@@ -2771,6 +2791,7 @@ function csvText(){
                         : (S.wGeo ? S.geoW.toFixed(3) + " (aus der Geometrie gemessen, Kamerahoehe "
                                     + S.camHeight.toFixed(2) + " m)"
                         : (S.wUsed || S.realW).toFixed(2) + " (angenommen)")) + "\n" +
+    "# fassung=" + VERSION + "\n" +
     "# tempoquelle=" + (S.speedMode === "gps" ? "GPS" : "von Hand " + S.manSpeed) +
       " wunschtempo=" + S.vSet + " zielluecke=" + S.gapTarget + "\n" +
     "zeit_s,box_px,abstand_roh_m,abstand_gefiltert_m,v_rel_kmh,v_eigen_kmh,v_vorn_kmh,zeitluecke_s\n";
