@@ -338,7 +338,7 @@ var S = {
   sound:true, vol:0.25, warnGap:1.8, lastBeep:0,
   track:null, learnedW:0, learnedN:0, srcLane:false, err:0,
   wUsed:0, wGelernt:false, hochHeck:false,
-  camHeight:1.25, yVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
+  camHeight:1.25, yVgeo:null, xVgeo:null, yVn:0, geoW:0, geoN:0, wGeo:false, geoRms:0,
   bestaetigt:0, festSeit:0, tippLaeuft:false, slopeBest:null,
   schilder:true, limit:null, schildKand:0, schildTick:0, odo:0, odoT:0,
   schildBox:null, laneMiss:0, ortsKand:0, ortsEnde:0, ortsBuchstaben:0,
@@ -517,7 +517,7 @@ function ownSpeed(){
    aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
    Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
    Aufzeichnung. */
-var VERSION = "18.11.2026 · 20:35";
+var VERSION = "19.11.2026 · 16:20";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -780,7 +780,7 @@ function laneDetect(fr){
   S.laneDbg = { band:[yTop, yBot], punkte:[0,0], linien:[0,0], a:[[],[]], grund:"" };
   if(yBot - yTop < Math.round(H*0.07)){ S.laneDbg.grund = "Suchstreifen zu schmal"; return null; }
   S.roadBot = yBot;
-  var left = [], right = [];
+  var alle = [];
   for(var y = yTop; y < yBot; y += 2){
     var row = y*W, sum = 0, cnt = 0;
     for(var x = 0; x < W; x++){ sum += g[row+x]; cnt++; }
@@ -791,9 +791,16 @@ function laneDetect(fr){
        sein: wo genau der Horizont im Bild liegt, haengt an der Neigung des
        Handys, und ein zu enges Fenster verfehlt die Markierung schon bei
        geringer Abweichung komplett. */
+    /* Frueher wurde nur ein Fenster um die BILDMITTE abgetastet, das nach
+       unten breiter wurde. Das setzt voraus, dass die Kamera entlang der
+       Spur zeigt. An seinen Aufnahmen gemessen tut sie das nicht: die
+       Strasse liegt in der linken Bildhaelfte, bei 62 Prozent der Hoehe
+       liegen ALLE Markierungen zwischen x=174 und 414 - die Bildmitte ist
+       540. Das Fenster schnitt sie oben also weg. Abgetastet wird deshalb
+       die ganze Zeile; was dadurch mehr hereinkommt, haelt die
+       Laengenpruefung der Linien ab. */
     var frac = (y - yTop) / Math.max(1, yBot - yTop);
-    var span = W * Math.min(0.5, 0.20 + 0.75*frac);
-    var x0 = Math.max(1, Math.round(W/2 - span)), x1 = Math.min(W-2, Math.round(W/2 + span));
+    var x0 = 1, x1 = W - 2;
     /* Gesucht wird zeilenweise, also waagerecht. Eine Markierung steht im
        Bild aber schraeg - unten im Bild bis zu 55 Grad zur Senkrechten -,
        und ihr waagerechter Schnitt ist dann fast doppelt so breit wie die
@@ -808,8 +815,7 @@ function laneDetect(fr){
       if((!hot || xx === x1) && runStart >= 0){
         var wRun = xx - runStart;
         if(wRun >= 1 && wRun <= maxRun){
-          var cxr = runStart + wRun/2;
-          (cxr < W/2 ? left : right).push({ x:cxr, y:y });
+          alle.push({ x:runStart + wRun/2, y:y });
         }
         runStart = -1;
       }
@@ -845,9 +851,17 @@ function laneDetect(fr){
     if(!(yRand > 0)) yRand = yBot;
     return f.y1 >= Math.min(yBot, yRand) - schlupf;
   }
-  var kandL = findLines(left,  need, 2, 2).filter(function(f){ return reichtRunter(f) && f.a <=  0.08; });
-  var kandR = findLines(right, need, 2, 2).filter(function(f){ return reichtRunter(f) && f.a >= -0.08; });
-  S.laneDbg.punkte = [left.length, right.length];
+  /* Die Linien werden aus EINEM Topf gesucht und erst danach nach ihrer
+     Steigung einer Seite zugeordnet. Das Vorzeichen der Steigung ist
+     geometrisch belastbar - eine linke Markierung laeuft nach unten nach
+     links, eine rechte nach rechts, egal wohin die Kamera zielt. Die
+     Bildmitte dagegen sagt darueber nichts. Bei seiner Halterung lagen
+     beide Markierungen links der Mitte und damit im selben Topf; die
+     Spur konnte so gar nicht gefunden werden ("links keine Linie"). */
+  var linien = findLines(alle, need, 4, 2).filter(reichtRunter);
+  var kandL = linien.filter(function(f){ return f.a <=  0.08; });
+  var kandR = linien.filter(function(f){ return f.a >= -0.08; });
+  S.laneDbg.punkte = [alle.length, linien.length];
   S.laneDbg.linien = [kandL.length, kandR.length];
   S.laneDbg.a = [kandL.map(function(f){ return +f.a.toFixed(2); }),
                  kandR.map(function(f){ return +f.a.toFixed(2); })];
@@ -866,8 +880,19 @@ function laneDetect(fr){
     /* Beurteilt wird dort, wo beide Markierungen tatsaechlich gesehen wurden,
        nicht an den Raendern des Suchstreifens: sonst haengt das Urteil an der
        Neigung des Handys. */
-    var oY = Math.max(L.y0, R.y0), uY = Math.min(L.y1, R.y1);
-    if(uY - oY < need*0.45){ grund = "zu wenig Überschneidung"; return null; }
+    /* Beurteilt wurde frueher nur der Abschnitt, in dem BEIDE Markierungen
+       gesehen wurden. Das ist zu streng: eine gestrichelte Leitlinie wird
+       weiter oben erkannt, eine durchgezogene Randlinie weiter unten, und
+       ihre Abschnitte ueberlappen sich kaum. An seinen Aufnahmen scheiterte
+       genau daran ein Paar mit sonst stimmigen Steigungen (-0,32 und
+       +0,82). Geraden lassen sich aber ueber ihren gesehenen Abschnitt
+       hinaus auswerten, solange man im Suchstreifen bleibt - und ob das
+       Paar wirklich eine Fahrspur ist, pruefen Zusammenlaufen,
+       Kamerahoehe und die Asphaltprobe ohnehin. */
+    var oY = Math.min(L.y0, R.y0), uY = Math.min(yBot, Math.max(L.y1, R.y1));
+    var gesehen = Math.min(L.y1, R.y1) - Math.max(L.y0, R.y0);
+    if(uY - oY < need*0.45){ grund = "Linien zu kurz"; return null; }
+    if(gesehen < -need*0.9){ grund = "Linien liegen ganz auseinander"; return null; }
     var spanU = (R.a*uY + R.b) - (L.a*uY + L.b);
     var spanO = (R.a*oY + R.b) - (L.a*oY + L.b);
     if(spanU < W*0.10 || spanU > W*1.5){ grund = "Fahrbahn unten unmöglich breit"; return null; }
@@ -1033,11 +1058,22 @@ function nightDetect(fr){
    Breite des Vordermanns. */
 var geoFit = null;
 function geoReset(){
-  geoFit = { n:0, sw:0, sy:0, sww:0, swy:0, syy:0, wMin:1e9, wMax:0, lw:0, lx:0 };
+  geoFit = { n:0, sw:0, sy:0, sww:0, swy:0, syy:0, sx:0, swx:0,
+             wMin:1e9, wMax:0, lw:0, lx:0 };
 }
 geoReset();
 
 function geoSammeln(w, yU, cx, vh){
+  /* Nebenbei faellt der seitliche Fluchtpunkt ab. Fuer ein Fahrzeug der
+     Breite W mit seitlichem Versatz Xc gilt
+         x  = xV + f*Xc/d        w = f*W/d
+     also ist auch x eine GERADE ueber w, mit dem Achsenabschnitt xV.
+     Das ist wichtiger, als es klingt: ohne erkannte Spur nahm die App
+     bisher die BILDMITTE als Spurmitte an. Seine Halterung zielt aber
+     neben die Fahrtrichtung - die Strasse liegt in der linken
+     Bildhaelfte. Ein am Haus geparkter Transporter lag damit naeher an
+     der vermeintlichen Spurmitte als das Auto vor ihm und wurde als
+     Vordermann gemessen. Genau das steht auf seinem Schirmfoto. */
   var g = geoFit;
   /* An seiner echten Tagfahrt gemessen: wird einfach alles gesammelt, was
      als Ziel gilt, springt die Verfolgung zwischendurch auf ein anderes
@@ -1058,6 +1094,7 @@ function geoSammeln(w, yU, cx, vh){
   }
   g.lw = w; g.lx = cx;
   g.n++; g.sw += w; g.sy += yU; g.sww += w*w; g.swy += w*yU; g.syy += yU*yU;
+  g.sx = (g.sx || 0) + cx; g.swx = (g.swx || 0) + w*cx;
   if(w < g.wMin) g.wMin = w;
   if(w > g.wMax) g.wMax = w;
   /* Genug Punkte, und das Ziel muss dabei seine Groesse deutlich geaendert
@@ -1091,6 +1128,11 @@ function geoSammeln(w, yU, cx, vh){
     S.slopeBest = { a:a, n:g.n, rms:rms,
                     spanne:(g.wMax - g.wMin)/g.wMax, fest:jetztFest };
   S.yVgeo = S.yVgeo === null ? b : S.yVgeo*0.82 + b*0.18;
+  /* Derselbe Ausgleich fuer die Seite */
+  var ax = (g.n*g.swx - g.sw*g.sx)/den;
+  var bx = (g.sx - ax*g.sw)/g.n;
+  if(bx > -vh && bx < vh*2)
+    S.xVgeo = S.xVgeo === null ? bx : S.xVgeo*0.82 + bx*0.18;
   S.yVn++;
 }
 
@@ -1099,7 +1141,15 @@ function geoSammeln(w, yU, cx, vh){
    genau dann, wenn es interessant wird. */
 function laneMid(yVideo, vw){
   var lane = S.lane;
-  if(!lane) return vw/2;
+  if(!lane){
+    /* Ohne Spur nicht blind die Bildmitte nehmen - sie ist nur dann die
+       Spurmitte, wenn die Kamera entlang der Fahrbahn zeigt. Der aus den
+       Fahrzeugerkennungen gelernte seitliche Fluchtpunkt ist die
+       ehrlichere Antwort; er sagt, wohin die Strasse laeuft. */
+    if(S.xVgeo !== null && S.yVn >= 3 &&
+       S.xVgeo > vw*0.08 && S.xVgeo < vw*0.92) return S.xVgeo;
+    return vw/2;
+  }
   var ys = yVideo / lane.sc;
   var m = (((lane.L.a*ys + lane.L.b) + (lane.R.a*ys + lane.R.b))/2) * lane.sc;
   return (m > vw*0.10 && m < vw*0.90) ? m : vw/2;
