@@ -456,6 +456,7 @@ async function start(){
   S.lastDayHit = performance.now();
   showOptik();
   detectLoop();
+  schildLoop();
   requestAnimationFrame(draw);
 }
 
@@ -501,7 +502,7 @@ function ownSpeed(){
    aus dem Zwischenspeicher zeigt - und genau diese Frage stand schon im
    Raum. Sie steht in der Kopfzeile, in den Einstellungen und in jeder
    Aufzeichnung. */
-var VERSION = "19.11.2026 · 17:30";
+var VERSION = "19.11.2026 · 19:10";
 var VEHICLES = { car:1, truck:1, bus:1, motorcycle:1 };
 var REALW = { car:1.80, truck:2.50, bus:2.55, motorcycle:0.80 };
 
@@ -832,6 +833,46 @@ function pickTarget(cands, vw){
   return best;
 }
 
+/* ---------------- Die Schildsuche bekommt ihren eigenen Takt ----------
+   Sie lief bisher in detectLoop mit, also genau einmal je Modelldurchgang.
+   Das Modell braucht auf seinem Pixel 60 bis 150 ms - auf seinen eigenen
+   Bildschirmfotos standen drei bis vier Bilder je Sekunde. Die
+   Schildsuche selbst kostet gemessen 3,65 ms. Sie wurde also von rund
+   zweihundert moeglichen Durchgaengen je Sekunde auf drei gebremst,
+   ohne dass sie irgendetwas davon gehabt haette.
+   Was das austraegt, sagt die Geometrie. Bei 776 Punkten Brennweite ist
+   ein 0,75-m-Schild erst ab rund 11 m Abstand 55 Punkte gross - und
+   darunter liest der Leser an seinen echten Bildern nichts mehr
+   (gemessen: 20 von 20 bei 55 Punkten, 9 von 20 bei 46). Nach unten
+   endet das Fenster bei etwa 4,5 m, dort laeuft das Schild seitlich aus
+   dem Bild. Es bleiben gut sechs Meter; bei Tempo 50 sind das 0,44
+   Sekunden. Mit drei Bildern je Sekunde ist das EIN Blick - und der muss
+   dann auch noch sitzen. Genau das stand bei seiner Fahrt auf dem
+   Schirm: einmal erkannt, die ganze Fahrt lang.
+   Mit zwoelf Durchgaengen je Sekunde sind es fuenf Blicke. Gekostet
+   wird dafuer 12 mal 3,65 ms, also gut vier Prozent der Rechenzeit -
+   das Modell allein braucht ein Vielfaches davon.
+   Findet das Geraet den Takt nicht (altes Handy, heisser Prozessor),
+   verlangsamt sich die Schleife von selbst: sie misst, wie lange ein
+   Durchgang wirklich dauert, und laesst immer mindestens das Achtfache
+   davon Pause. So kann sie nie mehr als ein Achtel der Zeit belegen. */
+async function schildLoop(){
+  var ziel = 1000/12;                       // zwoelf Durchgaenge je Sekunde
+  while(S.running){
+    var t0 = performance.now();
+    if(S.schilder && video && video.readyState >= 2 && video.videoWidth){
+      S.schildTick++;
+      try{ schilderLesen(video.videoWidth, video.videoHeight); }
+      catch(e){ S.schildFehler = e.message; }
+    }
+    var kosten = performance.now() - t0;
+    S.schildMs = S.schildMs ? S.schildMs*0.9 + kosten*0.1 : kosten;
+    /* Nie mehr als ein Achtel der Zeit fuer die Schildsuche */
+    var pause = Math.max(ziel - kosten, S.schildMs*7);
+    await new Promise(function(r){ setTimeout(r, Math.max(4, Math.round(pause))); });
+  }
+}
+
 async function detectLoop(){
   while(S.running){
     var tLoop = performance.now();
@@ -890,10 +931,8 @@ async function detectLoop(){
           if(S.bilder.length > 8) S.bilder.shift();
         }catch(e){}
       }
-      S.schildTick++;
-      if(S.schilder && vw){
-        try{ schilderLesen(vw, vh); }catch(e){ S.schildFehler = e.message; }
-      }
+      /* Die Schildsuche laeuft nicht mehr hier - sie hat ihre eigene
+         Schleife, siehe schildLoop(). Grund steht dort. */
       if(fr && (S.mode === "night" || (S.mode === "auto" && S.lum < 115)))
         nres = nightDetect(fr);
       /* In der Daemmerung ist es fuer das Modell schon zu dunkel, fuer eine
@@ -1308,6 +1347,11 @@ function draw(){
     var kurz = { "kein":"Ring", "zu":"klein", "keine":"Ziffern",
                  "Ziffern":"verschmolzen", "Innenfeld":"Feld" };
     var teile = [sd.groessterFleck + "px"];
+    /* Wie oft je Sekunde wirklich gesucht wird - seit die Schildsuche
+       ihren eigenen Takt hat, ist das die wichtigste Zahl auf der
+       Zeile: darunter stand sie bei drei, jetzt soll sie bei zwoelf
+       liegen. */
+    if(S.schildMs > 0) teile.push(Math.round(1000/Math.max(1000/12, S.schildMs*8)) + "/s");
     for(var gg in (sd.gruende || {}))
       if(sd.gruende[gg] > 0) teile.push((kurz[gg] || gg) + " " + sd.gruende[gg]);
     if(sd.gesehen - sd.verworfen > 0) teile.push("ok " + (sd.gesehen - sd.verworfen));
@@ -1548,7 +1592,7 @@ var LESER = (function(){
   }
 
   /* Welche Zahlen stehen ueberhaupt auf deutschen Zeichen 274 */
-  var ERLAUBT = {10:1,20:1,30:1,40:1,50:1,60:1,70:1,80:1,90:1,
+  var ERLAUBT = {20:1,30:1,40:1,50:1,60:1,70:1,80:1,90:1,
                  100:1,110:1,120:1,130:1};
 
   function lies(cv, redMin){
@@ -1674,7 +1718,16 @@ var LESER = (function(){
          Limit nicht. */
       wert = null;
     } else if(anzahl === 2){
-      if(ziffern[0] >= 1 && ziffern[0] <= 9) wert = ziffern[0]*10;
+      /* Eine fuehrende 1 bei zwei Ziffern gibt es auf keinem deutschen
+         Tempolimit: zweistellig sind nur 20 bis 90, dreistellig nur 100
+         bis 130 - die fangen alle mit 1 an. Liest der Leser also "10",
+         dann hat er bei einer 100 die mittlere Null verloren, nicht ein
+         Zehn-km/h-Schild gefunden. Genau das ist an seinen Bildern
+         passiert: aus einer 100 wurde eine 10.
+         Ein verpasstes Schild kostet nichts; ein Limit von 10 statt 100
+         anzuzeigen waere grob irrefuehrend. Also wird in diesem Fall
+         gar nichts gemeldet. */
+      if(ziffern[0] >= 2 && ziffern[0] <= 9) wert = ziffern[0]*10;
     } else {
       if(ziffern[1] >= 0 && ziffern[1] <= 3) wert = 100 + ziffern[1]*10;
     }
@@ -1779,12 +1832,16 @@ function roteFlecken(img, W, H, redMin){
       var anz = Math.min(3, Math.max(2, Math.round(bh/bw)));
       for(var k=0;k<anz;k++){
         var oy = Math.round(miny + k*(bh - bw)/(anz - 1));
-        stuecke.push({ x:minx, y:oy, w:bw, h:bw, geteilt:true });
+        /* Der Fuellgrad des ganzen Klumpens gilt hier nur als grobe
+           Schaetzung fuer jedes Stueck - genauer waere es, ihn je Fenster
+           neu zu zaehlen, aber das kostet einen weiteren Durchlauf. */
+        stuecke.push({ x:minx, y:oy, w:bw, h:bw, geteilt:true,
+                       z:Math.round(z*bw/bh) });
       }
     } else {
       if(Math.abs(bw-bh) > 0.40*Math.max(bw,bh)) continue;
       if(z < bw*bh*0.10) continue;
-      stuecke = [{ x:minx, y:miny, w:bw, h:bh, geteilt:false }];
+      stuecke = [{ x:minx, y:miny, w:bw, h:bh, geteilt:false, z:z }];
     }
     for(var si=0; si<stuecke.length; si++){
       raus.push(stuecke[si]);
@@ -1927,9 +1984,28 @@ function schilderLesen(vw, vh){
      dem Videobild in voller Aufloesung, und dort entscheidet sich, ob es
      wirklich ein Schild ist. */
   var flecken = roteFlecken(img, hw, hh, S.redMin*0.28);
-  /* Die groessten zuerst - sie sind am ehesten lesbar - und hoechstens
-     drei je Durchgang, damit die Bildrate nicht leidet. */
-  flecken.sort(function(a,b){ return b.w - a.w; });
+  /* Bisher kam der BREITESTE Fleck zuerst dran, und nur die drei
+     groessten wurden gelesen. In seinem Ort ist der breiteste rote Fleck
+     aber eine Backsteinwand: an seinen Bildern gemessen 200 mal 130
+     Punkte, waehrend ein Schild in 20 m Abstand nur 55 misst. Das echte
+     Schild fiel damit in sieben von zweiunddreissig Faellen aus den
+     gelesenen drei heraus - und zwar genau bei den kleinen, also weit
+     entfernten, auf die es ankommt.
+     Entscheidend ist nicht die Groesse, sondern die FORM. Ein Zeichen
+     274 ist ein RING: sein roter Umriss ist quadratisch (kurze durch
+     lange Seite nahe 1) und fuellt sein eigenes Rechteck nur zu rund
+     0,34 aus - gemessen an seinen Bildern immer zwischen 0,38 und 0,42.
+     Eine Hauswand fuellt ihres fast ganz, Herbstlaub kaum. Nach diesen
+     beiden Massen sortiert lag das echte Schild in ALLEN
+     zweiunddreissig Faellen auf Platz eins. */
+  for(var fi=0; fi<flecken.length; fi++){
+    var fo = flecken[fi];
+    var rundheit = Math.min(fo.w, fo.h) / Math.max(fo.w, fo.h);
+    var fuellung0 = (fo.z || 0) / Math.max(1, fo.w*fo.h);
+    var ringNah = Math.exp(-Math.pow((fuellung0 - 0.34)/0.22, 2));
+    fo.guete = rundheit*ringNah*100 + fo.w*0.01;   // Groesse nur als Nachrang
+  }
+  flecken.sort(function(a,b){ return b.guete - a.guete; });
   if(flecken.length > 3) flecken.length = 3;
   S.schildKand = flecken.length;
 
